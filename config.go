@@ -19,6 +19,15 @@ const (
 	LocalOnly
 )
 
+// RedisConfig configures the Redis adapter. Construction performs no network I/O.
+// Each TIME, PING, or accounting attempt has one Timeout budget, including
+// NOSCRIPT fallback, connection acquisition and routing.
+//
+// An injected Client remains caller-owned and must honor context deadlines,
+// including pool acquisition and socket I/O. Configure ContextTimeoutEnabled,
+// finite dial/read/write/pool timeouts no greater than Timeout, and bounded
+// retries. Clients or hooks which ignore context cancellation cannot be bounded
+// by this library. Owned clients disable automatic retries.
 type RedisConfig struct {
 	Address string
 	Prefix  string

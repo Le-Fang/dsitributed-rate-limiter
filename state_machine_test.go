@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -271,5 +272,196 @@ func TestStateMachineFoundationDelayedDuplicateAck(t *testing.T) {
 	}}
 	if err := checkTrace(trace); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// redisReference uses arbitrary-precision numerator arithmetic independent of
+// Lua's bounded decomposition. Executed deductions are recorded separately from
+// delivered acknowledgements; a lost reply cannot erase a committed deduction.
+type redisReference struct {
+	rate, burst      int64
+	balanceNumerator *big.Int
+	logical          int64
+	sessions         map[string]referenceSession
+}
+type referenceSession struct {
+	slot               int
+	sequence           uint64
+	delta, cap, expiry int64
+}
+
+func (m *redisReference) execute(c command, now int64) reply {
+	if m.sessions == nil {
+		m.sessions = make(map[string]referenceSession)
+		m.balanceNumerator = new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
+		m.logical = now
+	}
+	logical := now
+	if logical < m.logical {
+		logical = m.logical
+	}
+	balance := new(big.Int).Add(m.balanceNumerator, new(big.Int).Mul(big.NewInt(logical-m.logical), big.NewInt(m.rate)))
+	full := new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
+	if balance.Cmp(full) > 0 {
+		balance.Set(full)
+	}
+	s, exists := m.sessions[c.Session]
+	code := outcomeOK
+	fresh := false
+	if c.Op == opInit {
+		if logical >= c.RegistrationDeadlineMS {
+			return reply{Outcome: outcomeInitExpired}
+		}
+		if !exists {
+			s = referenceSession{slot: len(m.sessions), cap: c.Delta}
+			fresh = true
+		}
+	} else {
+		if !exists || s.slot != c.Slot || s.expiry <= logical {
+			return reply{Outcome: outcomeSessionExpired}
+		}
+		if c.Op == opApply {
+			if c.Sequence == s.sequence && c.Delta == s.delta {
+				code = outcomeDuplicate
+			} else if c.Sequence == s.sequence+1 {
+				balance.Sub(balance, new(big.Int).Mul(big.NewInt(c.Delta), big.NewInt(1_000_000_000)))
+				s.sequence, s.delta = c.Sequence, c.Delta
+			} else {
+				return reply{Outcome: outcomeSequenceError}
+			}
+		}
+	}
+	s.expiry = logical + 86400000
+	m.sessions[c.Session] = s
+	m.balanceNumerator = balance
+	m.logical = logical
+	// Euclidean division gives floor for negative debt and a nonnegative carry.
+	whole := new(big.Int).Div(new(big.Int).Set(balance), big.NewInt(1000)).Int64()
+	need := new(big.Int).Sub(big.NewInt(1_000_000_000), balance)
+	retry := int64(0)
+	if need.Sign() > 0 {
+		need.Add(need, big.NewInt(m.rate-1))
+		retry = need.Div(need, big.NewInt(m.rate)).Int64()
+	}
+	return reply{Outcome: code, Slot: s.slot, CommittedSequence: s.sequence, BalanceU: whole, RetryMS: retry, SessionTTLMS: s.expiry - now, LogicalMS: logical, FreshInit: fresh}
+}
+
+func TestStateMachineFoundationRedisDifferential(t *testing.T) {
+	client, key := redisFixture(t)
+	data, err := os.ReadFile("testdata/redis/foundation.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []struct {
+		Kind    string
+		Cost    int64
+		Attempt int
+	}
+	if err = json.Unmarshal(data, &events); err != nil {
+		t.Fatal(err)
+	}
+	base := initCommand(t, client)
+	base.RateU = 333333
+	model := redisReference{rate: base.RateU, burst: base.BurstU}
+	var ledger ledger
+	type attempt struct {
+		command            command
+		response           reply
+		executed, finished bool
+	}
+	attempts := map[int]*attempt{}
+	var admitted, applied int64
+	compare := func(c command) reply {
+		actual := evalProtocol(t, client, key, redisLua, c)
+		want := model.execute(c, actual.LogicalMS)
+		if actual != want {
+			t.Fatalf("command=%+v got=%+v oracle=%+v", c, actual, want)
+		}
+		return actual
+	}
+	for index, e := range events {
+		t.Logf("event %d: %+v", index, e)
+		switch e.Kind {
+		case "initialize":
+			r := compare(base)
+			base.Slot = r.Slot
+			base.RegistrationDeadlineMS = 0
+		case "admit":
+			if !ledger.admit(e.Cost, 10) {
+				t.Fatal("unexpected rejection")
+			}
+			admitted += e.Cost
+		case "begin":
+			payload, ok := ledger.begin()
+			if !ok {
+				t.Fatal("no batch")
+			}
+			c := base
+			c.Op, c.Sequence, c.Delta = opApply, payload.Sequence, payload.Delta
+			attempts[e.Attempt] = &attempt{command: c}
+		case "execute":
+			a := attempts[e.Attempt]
+			if a == nil || a.executed {
+				t.Fatal("invalid execution")
+			}
+			a.response = compare(a.command)
+			a.executed = true
+			if a.response.Outcome == outcomeOK {
+				applied += a.command.Delta
+			}
+		case "lose", "deliver":
+			a := attempts[e.Attempt]
+			if a == nil || !a.executed || a.finished {
+				t.Fatal("invalid delivery")
+			}
+			a.finished = true
+			if e.Kind == "deliver" {
+				if !ledger.acknowledge(batch{Sequence: a.response.CommittedSequence, Delta: a.command.Delta}) {
+					t.Fatal("ack failed")
+				}
+			}
+		case "refresh":
+			c := base
+			c.Op, c.Sequence, c.Delta = opRefresh, 0, 0
+			compare(c)
+		default:
+			t.Fatalf("unsupported event %s", e.Kind)
+		}
+		if applied > admitted || ledger.outstanding() < 0 || ledger.outstanding() > 10 {
+			t.Fatalf("conservation/cap admitted=%d applied=%d ledger=%+v", admitted, applied, ledger)
+		}
+	}
+	if admitted != 5 || applied != admitted || ledger.outstanding() != 0 {
+		t.Fatalf("lost or double charged consumption: admitted=%d applied=%d ledger=%+v", admitted, applied, ledger)
+	}
+}
+
+func TestStateMachineFoundationRedisNumericDifferential(t *testing.T) {
+	for _, rate := range []int64{1, 999, 1000, 1001, 333333, 999999999999, 1000000000000} {
+		t.Run(fmt.Sprint(rate), func(t *testing.T) {
+			client, key := redisFixture(t)
+			c := initCommand(t, client)
+			now := c.RegistrationDeadlineMS - 30000
+			c.RateU, c.BurstU, c.Delta = rate, 1_000_000_000_000, 1_000_000
+			model := redisReference{rate: c.RateU, burst: c.BurstU}
+			compare := func(c command, now int64) reply {
+				actual := evalProtocol(t, client, key, controlledLua(now), c)
+				want := model.execute(c, now)
+				if actual != want {
+					t.Fatalf("rate=%d c=%+v time=%d got=%+v want=%+v", rate, c, now, actual, want)
+				}
+				return actual
+			}
+			r := compare(c, now)
+			c.Op, c.Slot, c.Sequence, c.RegistrationDeadlineMS = opApply, r.Slot, 1, 0
+			compare(c, now)
+			c.Sequence = 2
+			compare(c, now)
+			compare(c, now)
+			c.Op, c.Sequence, c.Delta = opRefresh, 0, 0
+			for _, elapsed := range []int64{1, 2, 999, 1000, 1001, 1_000_001, 86_399_999} {
+				compare(c, now+elapsed)
+			}
+		})
 	}
 }

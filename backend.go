@@ -60,3 +60,36 @@ type backend interface {
 	Probe(context.Context) error
 	Close() error // Only the adapter's owned client is closed.
 }
+
+// protocolDisposition is application policy, independent of the Redis adapter.
+// Reinitialize is allowed only without unresolved normal consumption. The caller
+// retains immutable in-flight batches and applies scheduling/lifecycle changes.
+type protocolDisposition struct {
+	Reason                             string
+	Authorized, Terminal, Reinitialize bool
+	RetryDelay                         time.Duration
+}
+
+func protocolResult(r reply, unresolved bool) protocolDisposition {
+	switch r.Outcome {
+	case outcomeOK, outcomeDuplicate:
+		if r.authorizes() {
+			return protocolDisposition{Reason: ReasonAllowed, Authorized: true}
+		}
+		return protocolDisposition{Reason: ReasonGlobalLimit}
+	case outcomeInitExpired:
+		if !unresolved {
+			return protocolDisposition{Reason: ReasonSyncPending, Reinitialize: true}
+		}
+	case outcomeVersionMismatch, outcomePolicyMismatch:
+		return protocolDisposition{Reason: ReasonPolicyMismatch, Terminal: true}
+	case outcomeSessionExpired:
+		if unresolved {
+			return protocolDisposition{Reason: ReasonAccountingExpired, Terminal: true}
+		}
+		return protocolDisposition{Reason: ReasonSyncPending, Reinitialize: true}
+	case outcomeSessionCapacity:
+		return protocolDisposition{Reason: ReasonCapacityExhausted, RetryDelay: time.Second}
+	}
+	return protocolDisposition{Reason: ReasonAccountingError, Terminal: true}
+}

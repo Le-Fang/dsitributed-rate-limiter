@@ -1,0 +1,15 @@
+[
+ {"kind":"initialize"},
+ {"kind":"admit","cost":3},
+ {"kind":"begin","attempt":1},
+ {"kind":"execute","attempt":1},
+ {"kind":"lose","attempt":1},
+ {"kind":"admit","cost":2},
+ {"kind":"begin","attempt":2},
+ {"kind":"execute","attempt":2},
+ {"kind":"deliver","attempt":2},
+ {"kind":"begin","attempt":3},
+ {"kind":"execute","attempt":3},
+ {"kind":"deliver","attempt":3},
+ {"kind":"refresh"}
+]
