@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -83,6 +84,10 @@ type foundationOracle struct {
 	tokens                            *big.Rat
 	initialized, rejected             bool
 	freshNS                           int64
+	createdNS, refillNS               int64
+	generation                        uint64
+	fallback                          bool
+	fallbackAccepted                  int64
 	slot                              int
 	busy                              uint64
 }
@@ -100,6 +105,7 @@ type foundationAttempt struct {
 	payload                      attempt
 	response                     reply
 	sequence                     uint64
+	generation                   uint64
 	executed, finished, timedOut bool
 }
 type envelopeBoundary struct {
@@ -137,11 +143,14 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 		cfg.SyncNS = int64(100 * time.Millisecond)
 	}
 	clocks := make([]*fakeClock, cfg.Instances)
+	generations := make([]uint64, cfg.Instances)
+	openCircuits := make([]bool, cfg.Instances)
 	limiters := make([]*Limiter, cfg.Instances)
 	start := time.Unix(1700000000, 0)
 	for i := range clocks {
 		clocks[i] = newFakeClock(start)
-		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 100, idleTTL: time.Minute}
+		generations[i] = 1
+		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 100, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
 		limiters[i] = newLimiterCore(c, context.Background(), clocks[i], &fakeBackend{clock: clocks[i]}, nil)
 	}
 	subjects := map[modelBucketID]*foundationSubject{}
@@ -173,7 +182,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				return fail(index, "store capacity")
 			}
 			subjects[id] = &foundationSubject{limiter: l, bucket: b}
-			oracles[id] = &foundationOracle{tokens: big.NewRat(int64(cfg.LocalBurst), 1)}
+			oracles[id] = &foundationOracle{tokens: big.NewRat(int64(cfg.LocalBurst), 1), createdNS: nowNS, refillNS: nowNS}
 			if remotes[id.key] == nil {
 				remotes[id.key] = &redisReference{rate: cfg.RateU, burst: int64(cfg.Burst) * 1e6}
 			}
@@ -195,6 +204,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			oracle.initialized = true
 			oracle.rejected = r.BalanceU < 1e6
 			oracle.freshNS = nowNS + cfg.FreshnessNS
+			oracle.generation = generations[id.instance]
 		case "AdvanceTime":
 			if event.AdvanceNS < 0 {
 				return fail(index, "negative time advance")
@@ -203,12 +213,27 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			for _, c := range clocks {
 				c.Advance(time.Duration(event.AdvanceNS))
 			}
-			for _, o := range oracles {
-				o.tokens.Add(o.tokens, new(big.Rat).SetFrac(new(big.Int).Mul(big.NewInt(cfg.LocalRateU), big.NewInt(event.AdvanceNS)), big.NewInt(1_000_000_000_000_000)))
-				full := big.NewRat(int64(cfg.LocalBurst), 1)
-				if o.tokens.Cmp(full) > 0 {
-					o.tokens.Set(full)
-				}
+		case "OpenCircuit":
+			subject.limiter.recordFailure(transientFailure())
+			if !openCircuits[id.instance] {
+				generations[id.instance]++
+			}
+			openCircuits[id.instance] = true
+		case "ProbeSuccess":
+			if !openCircuits[id.instance] || !subject.limiter.beginProbe() {
+				return fail(index, "probe unavailable")
+			}
+			subject.limiter.finishProbe(nil)
+			openCircuits[id.instance] = false
+		case "RequireNormal":
+			if openCircuits[id.instance] || oracle.fallback || oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS {
+				return fail(index, "fair reconciliation did not restore normal admission")
+			}
+			subject.bucket.mu.Lock()
+			normal := !subject.bucket.fallback && subject.bucket.authorizedGeneration == generations[id.instance] && clocks[id.instance].Now().Before(subject.bucket.freshUntil)
+			subject.bucket.mu.Unlock()
+			if !normal {
+				return fail(index, "subject failed to restore normal admission")
 			}
 		case "AllowN":
 			var outstanding int64
@@ -217,30 +242,59 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 					outstanding += r.cost
 				}
 			}
-			want := event.Cost > 0 && event.Cost <= cfg.LocalBurst && event.Cost <= cfg.Cap && oracle.initialized && !oracle.rejected && nowNS < oracle.freshNS && int64(event.Cost) <= int64(cfg.Cap)-outstanding && oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) >= 0
-			wantReason := ReasonAllowed
+			invalid := event.Cost <= 0 || event.Cost > cfg.LocalBurst || event.Cost > cfg.Cap
+			unavailable := openCircuits[id.instance] || (oracle.initialized && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS)) || (!oracle.initialized && nowNS-oracle.createdNS >= cfg.FreshnessNS)
+			// Independent rational refill, delayed until the same observable
+			// transition. No production token, ledger or admission helpers.
+			if !invalid {
+				if cfg.Policy == LocalOnly && unavailable && !oracle.fallback {
+					oracle.refill(nowNS, cfg.FallbackRateU, cfg.LocalBurst)
+					oracle.clamp(cfg.FallbackBurst)
+					oracle.fallback = true
+				} else if oracle.fallback {
+					oracle.refill(nowNS, cfg.FallbackRateU, cfg.FallbackBurst)
+				} else {
+					oracle.refill(nowNS, cfg.LocalRateU, cfg.LocalBurst)
+				}
+			}
+			wantReason, wantMode := ReasonAllowed, ModeNormal
 			switch {
-			case event.Cost <= 0 || event.Cost > cfg.LocalBurst || event.Cost > cfg.Cap:
-				wantReason = ReasonInvalidRequest
+			case invalid:
+				wantReason, wantMode = ReasonInvalidRequest, ModeBlocked
 			case oracle.rejected:
-				wantReason = ReasonGlobalLimit
+				wantReason, wantMode = ReasonGlobalLimit, ModeBlocked
+			case cfg.Policy == LocalOnly && oracle.fallback:
+				wantReason, wantMode = ReasonLocalFallback, ModeLocalFallback
+				if event.Cost > cfg.FallbackBurst || oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) < 0 {
+					wantReason = ReasonFallbackLimit
+				}
+			case openCircuits[id.instance]:
+				wantReason, wantMode = ReasonRedisUnavailable, ModeBlocked
 			case !oracle.initialized:
-				wantReason = ReasonSyncPending
-			case nowNS >= oracle.freshNS:
-				wantReason = ReasonRedisUnavailable
+				wantReason, wantMode = ReasonSyncPending, ModeBlocked
+				if unavailable {
+					wantReason = ReasonRedisUnavailable
+				}
+			case unavailable:
+				wantReason, wantMode = ReasonRedisUnavailable, ModeBlocked
 			case int64(event.Cost) > int64(cfg.Cap)-outstanding:
-				wantReason = ReasonSyncPending
+				wantReason, wantMode = ReasonSyncPending, ModeBlocked
 			case oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) < 0:
 				wantReason = ReasonLocalLimit
 			}
-			got, reason, _ := subject.limiter.AllowN(id.key, event.Cost)
-			if got != want || reason != wantReason {
-				return fail(index, "admission=%v reason=%s oracle=%v expectedReason="+wantReason+" tokens=%s outstanding=%d", got, reason, want, oracle.tokens.String(), outstanding)
+			want := wantReason == ReasonAllowed || wantReason == ReasonLocalFallback
+			got, reason, info := subject.limiter.AllowN(id.key, event.Cost)
+			if got != want || reason != wantReason || info.Mode != wantMode {
+				return fail(index, "admission=%v reason=%s mode=%s oracle=%v expectedReason=%s mode=%s tokens=%s outstanding=%d", got, reason, info.Mode, want, wantReason, wantMode, oracle.tokens.String(), outstanding)
 			}
 			if want {
-				oracle.receipts = append(oracle.receipts, modelReceipt{cost: int64(event.Cost)})
 				oracle.tokens.Sub(oracle.tokens, big.NewRat(int64(event.Cost), 1))
-				subject.accepted += int64(event.Cost)
+				if wantReason == ReasonLocalFallback {
+					oracle.fallbackAccepted += int64(event.Cost)
+				} else {
+					oracle.receipts = append(oracle.receipts, modelReceipt{cost: int64(event.Cost)})
+					subject.accepted += int64(event.Cost)
+				}
 			}
 		case "BeginAttempt", "RetrySameBatch":
 			if event.Attempt == 0 || attempts[event.Attempt] != nil || oracle.busy != 0 || !oracle.initialized {
@@ -283,10 +337,10 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			if delta > 0 {
 				wantCommand.Op, wantCommand.Sequence, wantCommand.Delta = opApply, oracle.flight, delta
 			}
-			if a.command != wantCommand {
+			if a.command != wantCommand || a.generation != generations[id.instance] {
 				return fail(index, "command=%+v oracle=%+v", a.command, wantCommand)
 			}
-			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: a, sequence: oracle.flight}
+			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: a, sequence: oracle.flight, generation: generations[id.instance]}
 			oracle.busy = event.Attempt
 		case "ExecuteRedis":
 			a := attempts[event.Attempt]
@@ -334,8 +388,32 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 						}
 						oracle.acknowledged, oracle.flight = a.sequence, 0
 					}
-					oracle.rejected = a.response.BalanceU < 1e6
-					oracle.freshNS = a.payload.start.Sub(start).Nanoseconds() + cfg.FreshnessNS
+					if a.generation == generations[id.instance] {
+						oracle.rejected = a.response.BalanceU < 1e6
+						if oracle.rejected {
+							oracle.freshNS = 0
+						} else {
+							if cfg.Policy == LocalOnly && !oracle.fallback && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS) {
+								oracle.refill(nowNS, cfg.FallbackRateU, cfg.LocalBurst)
+								oracle.clamp(cfg.FallbackBurst)
+								oracle.fallback = true
+							}
+							outstanding := int64(0)
+							for _, receipt := range oracle.receipts {
+								if !receipt.acknowledged {
+									outstanding += receipt.cost
+								}
+							}
+							if outstanding == 0 || (!oracle.fallback && oracle.generation == generations[id.instance]) {
+								oracle.freshNS = a.payload.start.Sub(start).Nanoseconds() + cfg.FreshnessNS
+								oracle.generation = generations[id.instance]
+								if oracle.fallback && nowNS < oracle.freshNS {
+									oracle.refill(nowNS, cfg.FallbackRateU, cfg.FallbackBurst)
+									oracle.fallback = false
+								}
+							}
+						}
+					}
 					oracle.busy = 0
 				}
 			}
@@ -374,6 +452,15 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			b := subject.bucket
 			b.mu.Lock()
 			l := b.ledger
+			expectedTokens, _ := o.tokens.Float64()
+			if math.Abs(b.tokens.tokens-expectedTokens) > 1e-9 || b.fallback != o.fallback {
+				b.mu.Unlock()
+				return fail(index, "local balance/mode tokens=%v expected=%v fallback=%v expected=%v", b.tokens.tokens, expectedTokens, b.fallback, o.fallback)
+			}
+			if subject.limiter.control.Load().generation != generations[id.instance] {
+				b.mu.Unlock()
+				return fail(index, "circuit generation mismatch")
+			}
 			var f batch
 			if l.Flight != nil {
 				f = *l.Flight
@@ -401,6 +488,18 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 		boundaries = append(boundaries, envelopeBoundary{ns: nowNS, totals: totals})
 	}
 	return nil
+}
+
+func (o *foundationOracle) refill(nowNS, rateU int64, burst int) {
+	o.tokens.Add(o.tokens, new(big.Rat).SetFrac(new(big.Int).Mul(big.NewInt(rateU), big.NewInt(nowNS-o.refillNS)), big.NewInt(1_000_000_000_000_000)))
+	o.clamp(burst)
+	o.refillNS = nowNS
+}
+func (o *foundationOracle) clamp(burst int) {
+	full := big.NewRat(int64(burst), 1)
+	if o.tokens.Cmp(full) > 0 {
+		o.tokens.Set(full)
+	}
 }
 
 func TestStateMachineFoundationDelayedDuplicateAck(t *testing.T) {

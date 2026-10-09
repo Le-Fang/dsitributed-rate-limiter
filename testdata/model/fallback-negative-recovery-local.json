@@ -1,0 +1,96 @@
+{
+  "Seed": 6003,
+  "Config": {
+    "Instances": 1,
+    "RateU": 1000000,
+    "Burst": 2,
+    "Cap": 5,
+    "LocalBurst": 5,
+    "LocalRateU": 10000000,
+    "Policy": 1,
+    "FallbackBurst": 3,
+    "FallbackRateU": 2000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "k"
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "k"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 5
+    },
+    {
+      "Kind": "OpenCircuit",
+      "Key": "k"
+    },
+    {
+      "Kind": "AdvanceTime",
+      "Key": "k",
+      "AdvanceNS": 500000000
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 1
+    },
+    {
+      "Kind": "ProbeSuccess",
+      "Key": "k"
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 1
+    },
+    {
+      "Kind": "AdvanceTime",
+      "Key": "k",
+      "AdvanceNS": 5000000000
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "RequireNormal",
+      "Key": "k"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 1
+    }
+  ]
+}

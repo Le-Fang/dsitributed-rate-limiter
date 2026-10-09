@@ -185,3 +185,42 @@ type testRedisError string
 
 func (e testRedisError) Error() string { return string(e) }
 func (e testRedisError) RedisError()   {}
+
+type redisTestError string
+
+func (e redisTestError) Error() string { return string(e) }
+func (e redisTestError) RedisError()   {}
+func TestRedisBackendErrorClassification(t *testing.T) {
+	cases := []struct {
+		err  error
+		want errorClass
+	}{
+		{context.Canceled, errorShutdown}, {redis.ErrPoolTimeout, errorTransient}, {redis.ErrClosed, errorPermanent}, {context.DeadlineExceeded, errorTransient},
+		{&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("refused")}, errorTransient},
+		{errMalformedReply, errorPermanent}, {errors.New("unknown"), errorPermanent},
+		{errors.New("LOADING text from unrelated source"), errorPermanent},
+	}
+	for _, code := range []string{"LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN", "BUSY", "READONLY", "OOM"} {
+		cases = append(cases, struct {
+			err  error
+			want errorClass
+		}{redisTestError(code + " detail"), errorTransient})
+	}
+	for _, code := range []string{"NOPERM", "NOAUTH", "WRONGPASS", "ERR syntax error", "ERR unknown script error", "NOSCRIPT", "MOVED", "ASK", "LOADINGOTHER", "BUSYKEY"} {
+		cases = append(cases, struct {
+			err  error
+			want errorClass
+		}{redisTestError(code + " detail"), errorPermanent})
+	}
+	for _, tc := range cases {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			if got := classifyBackendError(tc.err); got != tc.want {
+				t.Fatalf("class %v want %v", got, tc.want)
+			}
+			wrapped := classifyRedisError(tc.err)
+			if !errors.Is(wrapped, tc.err) || backendErrorClass(wrapped) != tc.want {
+				t.Fatalf("boundary lost cause/class: %v", wrapped)
+			}
+		})
+	}
+}

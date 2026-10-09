@@ -152,6 +152,7 @@ type bucket struct {
 	ledger                ledger
 	created, lastActivity time.Time
 	initialized           bool
+	fallback              bool     // recovery mode, even when policy parameters are equal
 	init                  *command // immutable registration identity/deadline, staged by worker
 	session               string
 	slot                  int

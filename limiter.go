@@ -3,26 +3,11 @@ package ratelimiter
 import (
 	"context"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type circuitState uint8
-
-const (
-	circuitHealthy circuitState = iota
-	circuitOpen
-	circuitProbing
-)
-
-// Every transition publishes a new allocation. Published snapshots are never
-// mutated or reused; pointer equality is the admission handshake (no ABA).
-type controlState struct {
-	closed     bool
-	circuit    circuitState
-	generation uint64
-	permanent  bool
-}
 type attempt struct {
 	command        command
 	batch          batch
@@ -33,14 +18,16 @@ type attempt struct {
 // Limiter performs bounded local admission and asynchronous shared accounting.
 // The core retains policy and ports, never public Config or concrete adapters.
 type Limiter struct {
-	cfg     coreConfig
-	parent  context.Context
-	clock   clock
-	backend backend
-	metrics Metrics
-	store   *bucketStore
-	control atomic.Pointer[controlState]
-	work    chan *bucket
+	cfg       coreConfig
+	parent    context.Context
+	clock     clock
+	backend   backend
+	metrics   Metrics
+	store     *bucketStore
+	control   atomic.Pointer[controlState]
+	work      chan *bucket
+	circuitMu sync.Mutex
+	probe     *controlState // protected by circuitMu; outstanding probe ownership
 }
 
 func newLimiterCore(c coreConfig, parent context.Context, clock clock, b backend, m Metrics) *Limiter {
@@ -66,10 +53,23 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 	var reason string
 	var allowed, notify bool
 	for {
+		priorTokens, priorFallback := b.tokens, b.fallback
 		state = l.control.Load()
 		now := l.clock.Now()
-		b.tokens.refill(now)
 		b.lastActivity = now
+		// Observe a lazy outage before any normal-rate refill. An already
+		// entered fallback remains active until a successful reconciliation.
+		// Recoverable admission latches still need conservative outage refill;
+		// their rejection reasons take precedence below, independently of policy.
+		unavailable := state.circuit != circuitHealthy ||
+			(b.initialized && (b.authorizedGeneration != state.generation || !now.Before(b.freshUntil))) ||
+			(!b.initialized && now.Sub(b.created) >= l.cfg.maxSyncAge)
+		if l.cfg.failurePolicy == LocalOnly && unavailable && !b.fallback && !state.closed && !state.permanent && l.parent.Err() == nil && b.terminalReason == "" {
+			b.tokens.setPolicyConservative(now, float64(l.cfg.fallbackRateU)/1e6, l.cfg.fallbackBurst)
+			b.fallback = true
+		} else {
+			b.tokens.refill(now)
+		}
 		info = l.bucketInfo(b)
 		reason = ReasonAllowed
 		notify = false
@@ -90,6 +90,19 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 		case !b.capacityUntil.IsZero():
 			reason = ReasonCapacityExhausted
 			notify = true
+		case l.cfg.failurePolicy == LocalOnly && b.fallback:
+			info.Mode = ModeLocalFallback
+			notify = true
+			if n > l.cfg.fallbackBurst || float64(n) > b.tokens.tokens {
+				reason = ReasonFallbackLimit
+				if n <= l.cfg.fallbackBurst {
+					info.RetryAfter = durationSeconds((float64(n) - b.tokens.tokens) / b.tokens.rate)
+					info.RetryAfterKnown = true
+				}
+			} else {
+				allowed = true
+				reason = ReasonLocalFallback
+			}
 		case state.circuit != circuitHealthy:
 			reason = ReasonRedisUnavailable
 		case !b.initialized:
@@ -126,13 +139,18 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 			break
 		}
 		if l.control.Load() != state {
+			// Recompute refill and policy from the original balance as well as
+			// the decision; speculative normal refill must not survive an outage.
+			b.tokens, b.fallback = priorTokens, priorFallback
 			continue
 		}
 		if allowed {
 			b.tokens.take(n)
-			b.ledger.admit(int64(n), int64(l.cfg.maxOutstanding))
+			if info.Mode == ModeNormal {
+				b.ledger.admit(int64(n), int64(l.cfg.maxOutstanding))
+			}
 			info.Remaining = int(b.tokens.tokens)
-			notify = b.ledger.Pending >= int64(l.cfg.syncThreshold)
+			notify = notify || b.ledger.Pending >= int64(l.cfg.syncThreshold)
 		}
 		break
 	}
@@ -283,16 +301,27 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 	// freed capacity before a negative/fractional balance has blocked admission.
 	b.globalRejected = !d.Authorized
 	b.retryAt = a.start.Add(durationMilliseconds(r.RetryMS))
-	if !d.Authorized {
-		b.freshUntil = time.Time{}
-		return
+	// A successful quota rejection is still a fresh observation. Capacity is
+	// independently guarded by globalRejected; a real outage/stale epoch below
+	// must still apply conservative fallback policy before reconciliation.
+	now := l.clock.Now()
+	// This key may not have observed the outage through Allow at all. Apply
+	// its lazy policy transition before reconciliation can resume normal refill.
+	if l.cfg.failurePolicy == LocalOnly && !b.fallback && a.command.Op != opInit &&
+		(b.authorizedGeneration != s.generation || !now.Before(b.freshUntil)) {
+		b.tokens.setPolicyConservative(now, float64(l.cfg.fallbackRateU)/1e6, l.cfg.fallbackBurst)
+		b.fallback = true
 	}
-	if b.authorizedGeneration != s.generation && b.ledger.outstanding() != 0 {
+	if (b.fallback || b.authorizedGeneration != s.generation) && b.ledger.outstanding() != 0 {
 		return
 	}
 	b.authorizedGeneration = s.generation
 	ttl := durationMilliseconds(r.SessionTTLMS)
 	b.freshUntil = a.start.Add(min(l.cfg.maxSyncAge, max(time.Duration(0), ttl-time.Minute)))
+	if d.Authorized && b.fallback && now.Before(b.freshUntil) {
+		b.tokens.setPolicy(now, float64(l.cfg.localRateU)/1e6, l.cfg.localBurst)
+		b.fallback = false
+	}
 }
 func durationMilliseconds(ms int64) time.Duration {
 	if ms <= 0 {

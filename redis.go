@@ -5,6 +5,10 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
+	"errors"
+	"io"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -14,7 +18,7 @@ import (
 var redisLua string
 
 // redisBackend owns wire serialization and transport only. Script outcomes are
-// application values; transport errors remain errors and never carry a balance.
+// application values; transport errors are classified at this boundary and never carry a balance.
 type redisBackend struct {
 	client  redis.UniversalClient
 	script  *redis.Script
@@ -38,12 +42,13 @@ func newRedisBackend(c normalizedConfig) (backend, error) {
 func (b *redisBackend) Time(ctx context.Context) (time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
-	return b.client.Time(ctx).Result()
+	value, err := b.client.Time(ctx).Result()
+	return value, classifyRedisError(err)
 }
 func (b *redisBackend) Probe(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
-	return b.client.Ping(ctx).Err()
+	return classifyRedisError(b.client.Ping(ctx).Err())
 }
 func (b *redisBackend) Execute(ctx context.Context, key string, c command) (reply, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
@@ -52,9 +57,10 @@ func (b *redisBackend) Execute(ctx context.Context, key string, c command) (repl
 	// arguments. It does not grant the fallback a new operation budget.
 	value, err := b.script.Run(ctx, b.client, []string{redisKey(b.prefix, key)}, encodeCommand(c)...).Result()
 	if err != nil {
-		return reply{}, err
+		return reply{}, classifyRedisError(err)
 	}
-	return decodeReply(value)
+	r, err := decodeReply(value)
+	return r, classifyRedisError(err)
 }
 func (b *redisBackend) Close() error {
 	if b.owned {
@@ -70,4 +76,38 @@ func newSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bits[:]), nil
+}
+
+// classifyBackendError owns Redis-specific interpretation. Exact RESP error
+// codes form an allowlist; unknown errors fail closed at the dependency level.
+func classifyBackendError(err error) errorClass {
+	if errors.Is(err, context.Canceled) {
+		return errorShutdown
+	}
+	if errors.Is(err, errMalformedReply) {
+		return errorPermanent
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, redis.ErrPoolTimeout) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return errorTransient
+	}
+	var wire redis.Error
+	if errors.As(err, &wire) {
+		code, _, _ := strings.Cut(wire.Error(), " ")
+		switch code {
+		case "LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN", "BUSY", "READONLY", "OOM":
+			return errorTransient
+		}
+		return errorPermanent
+	}
+	var network net.Error
+	if errors.As(err, &network) {
+		return errorTransient
+	}
+	return errorPermanent
+}
+func classifyRedisError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &backendError{class: classifyBackendError(err), cause: err}
 }

@@ -14,14 +14,16 @@ const shardCount = 64
 // or delivering callbacks. The linked lists make scan work independent of map
 // size. References and list links belong to the shard, all policy to the bucket.
 type bucketStore struct {
-	shards    [shardCount]storeShard
-	count     atomic.Int64
-	max       int64
-	rate      float64
-	burst     int
-	idleTTL   time.Duration
-	scanMu    sync.Mutex
-	scanShard int
+	shards        [shardCount]storeShard
+	count         atomic.Int64
+	max           int64
+	rate          float64
+	burst         int
+	idleTTL       time.Duration
+	fallbackRate  float64
+	fallbackBurst int
+	scanMu        sync.Mutex
+	scanShard     int
 }
 type storeShard struct {
 	mu           sync.Mutex
@@ -31,6 +33,9 @@ type storeShard struct {
 
 func newBucketStore(c coreConfig) *bucketStore {
 	s := &bucketStore{max: int64(c.maxKeys), rate: float64(c.localRateU) / 1e6, burst: c.localBurst, idleTTL: c.idleTTL}
+	if c.failurePolicy == LocalOnly {
+		s.fallbackRate, s.fallbackBurst = float64(c.fallbackRateU)/1e6, c.fallbackBurst
+	}
 	for i := range s.shards {
 		s.shards[i].keys = make(map[string]*bucket)
 	}
@@ -64,6 +69,9 @@ func (s *bucketStore) acquire(key string, now time.Time) (*bucket, bool) {
 	// Copy bounded key bytes; a short substring must not retain a large caller buffer.
 	key = strings.Clone(key)
 	b := &bucket{key: key, refs: 1, tokens: newTokenBucket(now, s.rate, s.burst), created: now, lastActivity: now, slot: -1}
+	// Track both refill deadlines from birth. Cleanup has no circuit knowledge;
+	// this conservatively retains normal keys through potential lazy outages.
+	b.tokens.fallbackRate, b.tokens.fallbackBurst = s.fallbackRate, s.fallbackBurst
 	if sh.head == nil {
 		b.next, b.prev = b, b
 		sh.head, sh.cursor = b, b
@@ -134,7 +142,10 @@ func (s *bucketStore) cleanup(now time.Time, limit int) {
 		visited++
 		sh.cursor = b.next
 		b.mu.Lock()
-		eligible := b.refs == 0 && !b.busy && !b.queued && b.ledger.outstanding() == 0 && !b.globalRejected && b.terminalReason == "" && b.capacityUntil.IsZero() && now.Sub(b.lastActivity) >= s.idleTTL && b.tokens.safeToEvict(now)
+		// Eligibility checks must not credit the live balance at a stale normal
+		// rate before admission has observed a circuit/policy transition.
+		tokens := b.tokens
+		eligible := b.refs == 0 && !b.busy && !b.queued && b.ledger.outstanding() == 0 && !b.globalRejected && b.terminalReason == "" && b.capacityUntil.IsZero() && now.Sub(b.lastActivity) >= s.idleTTL && tokens.safeToEvict(now)
 		if eligible {
 			if b.next == b {
 				sh.head, sh.cursor = nil, nil
