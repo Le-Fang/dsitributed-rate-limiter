@@ -1,12 +1,15 @@
 package ratelimiter
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 type modelEvent struct {
@@ -66,11 +69,9 @@ func TestStateMachineFoundationRejectsUnsupportedAndInvalidEvents(t *testing.T) 
 	}
 }
 
-// The foundation runs the real ledger against an independent receipt oracle.
-// Each accepted request leaves a receipt; expected pending, applied, unapplied,
-// and acknowledged totals are queries over receipts, never production helpers.
-// Redis execution is a controlled integer backend at this stage. The real Lua
-// and application scheduling will replace that subject seam in later tasks.
+// Requests leave independent receipts. The oracle uses rational local refill,
+// receipt queries and the independent integer Redis reference, never production
+// token/ledger/decision helpers. The subject runs real prepare/install/AllowN.
 type modelReceipt struct {
 	cost                  int64
 	sequence              uint64
@@ -79,37 +80,82 @@ type modelReceipt struct {
 type foundationOracle struct {
 	receipts                          []modelReceipt
 	latestBatch, flight, acknowledged uint64
+	tokens                            *big.Rat
+	initialized, rejected             bool
+	freshNS                           int64
+	slot                              int
+	busy                              uint64
 }
 type foundationSubject struct {
-	ledger            ledger
-	accepted, applied int64
-	remoteSequence    uint64
-	remoteDelta       int64
+	limiter  *Limiter
+	bucket   *bucket
+	accepted int64
 }
 type modelBucketID struct {
 	instance int
 	key      string
 }
 type foundationAttempt struct {
-	owner              modelBucketID
-	payload            batch
-	sequence           uint64
-	executed, finished bool
+	owner                        modelBucketID
+	payload                      attempt
+	response                     reply
+	sequence                     uint64
+	executed, finished, timedOut bool
+}
+type envelopeBoundary struct {
+	ns     int64
+	totals map[string]int64
 }
 
 func checkTrace(trace modelTrace) error {
-	if trace.Config.Instances <= 0 || trace.Config.Cap <= 0 || trace.Config.Cap > 1_000_000 {
-		return fmt.Errorf("seed %d: invalid model config %+v", trace.Seed, trace.Config)
+	return checkTraceWithExecution(trace, (*redisReference).execute)
+}
+
+// Execution remains independently replaceable so a regression can prove that
+// actual backend effects, not merely a prepared batch, drive conservation.
+func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, command, int64) reply) error {
+	cfg := trace.Config
+	if cfg.Instances <= 0 || cfg.Cap <= 0 || cfg.Cap > 1_000_000 {
+		return fmt.Errorf("seed %d: invalid model config %+v", trace.Seed, cfg)
 	}
-	subjects := make(map[modelBucketID]*foundationSubject)
-	oracles := make(map[modelBucketID]*foundationOracle)
-	attempts := make(map[uint64]*foundationAttempt)
+	if cfg.RateU == 0 {
+		cfg.RateU = 1_000_000
+	}
+	if cfg.Burst == 0 {
+		cfg.Burst = cfg.Cap
+	}
+	if cfg.LocalBurst == 0 {
+		cfg.LocalBurst = cfg.Cap
+	}
+	if cfg.LocalRateU == 0 {
+		cfg.LocalRateU = cfg.RateU
+	}
+	if cfg.FreshnessNS == 0 {
+		cfg.FreshnessNS = int64(time.Second)
+	}
+	if cfg.SyncNS == 0 {
+		cfg.SyncNS = int64(100 * time.Millisecond)
+	}
+	clocks := make([]*fakeClock, cfg.Instances)
+	limiters := make([]*Limiter, cfg.Instances)
+	start := time.Unix(1700000000, 0)
+	for i := range clocks {
+		clocks[i] = newFakeClock(start)
+		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 100, idleTTL: time.Minute}
+		limiters[i] = newLimiterCore(c, context.Background(), clocks[i], &fakeBackend{clock: clocks[i]}, nil)
+	}
+	subjects := map[modelBucketID]*foundationSubject{}
+	oracles := map[modelBucketID]*foundationOracle{}
+	attempts := map[uint64]*foundationAttempt{}
+	remotes := map[string]*redisReference{}
+	boundaries := []envelopeBoundary{{totals: map[string]int64{}}}
+	var nowNS int64
 	fail := func(index int, format string, args ...interface{}) error {
-		return fmt.Errorf("seed=%d config=%+v event=%d: %s; events=%+v", trace.Seed, trace.Config, index, fmt.Sprintf(format, args...), trace.Events[:index+1])
+		return fmt.Errorf("seed=%d config=%+v event=%d: %s; events=%+v", trace.Seed, cfg, index, fmt.Sprintf(format, args...), trace.Events[:index+1])
 	}
 	for index, event := range trace.Events {
 		id := modelBucketID{event.Instance, event.Key}
-		if event.Instance < 0 || event.Instance >= trace.Config.Instances {
+		if event.Instance < 0 || event.Instance >= cfg.Instances {
 			return fail(index, "invalid instance")
 		}
 		subject, oracle := subjects[id], oracles[id]
@@ -119,138 +165,240 @@ func checkTrace(trace modelTrace) error {
 		switch event.Kind {
 		case "CreateKey":
 			if subject != nil {
-				return fail(index, "duplicate key creation")
+				return fail(index, "duplicate key")
 			}
-			subjects[id], oracles[id] = &foundationSubject{}, &foundationOracle{}
-		case "AllowN":
-			var unresolved int64
-			for _, receipt := range oracle.receipts {
-				if !receipt.acknowledged {
-					unresolved += receipt.cost
+			l := limiters[id.instance]
+			b, ok := l.store.acquire(id.key, clocks[id.instance].Now())
+			if !ok {
+				return fail(index, "store capacity")
+			}
+			subjects[id] = &foundationSubject{limiter: l, bucket: b}
+			oracles[id] = &foundationOracle{tokens: big.NewRat(int64(cfg.LocalBurst), 1)}
+			if remotes[id.key] == nil {
+				remotes[id.key] = &redisReference{rate: cfg.RateU, burst: int64(cfg.Burst) * 1e6}
+			}
+		case "Initialize":
+			if oracle.initialized {
+				return fail(index, "duplicate initialization")
+			}
+			b, l := subject.bucket, subject.limiter
+			b.mu.Lock()
+			b.init = &command{Op: opInit, Session: fmt.Sprintf("%032x", id.instance+1), Slot: -1, Delta: int64(cfg.Cap), RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6, RegistrationDeadlineMS: start.UnixMilli() + nowNS/int64(time.Millisecond) + 30000}
+			b.mu.Unlock()
+			a, ok := l.prepareAttempt(b, clocks[id.instance].Now())
+			if !ok {
+				return fail(index, "init preparation failed")
+			}
+			r := execute(remotes[id.key], a.command, start.UnixMilli()+nowNS/int64(time.Millisecond))
+			l.installReply(b, a, r)
+			oracle.slot = r.Slot
+			oracle.initialized = true
+			oracle.rejected = r.BalanceU < 1e6
+			oracle.freshNS = nowNS + cfg.FreshnessNS
+		case "AdvanceTime":
+			if event.AdvanceNS < 0 {
+				return fail(index, "negative time advance")
+			}
+			nowNS += event.AdvanceNS
+			for _, c := range clocks {
+				c.Advance(time.Duration(event.AdvanceNS))
+			}
+			for _, o := range oracles {
+				o.tokens.Add(o.tokens, new(big.Rat).SetFrac(new(big.Int).Mul(big.NewInt(cfg.LocalRateU), big.NewInt(event.AdvanceNS)), big.NewInt(1_000_000_000_000_000)))
+				full := big.NewRat(int64(cfg.LocalBurst), 1)
+				if o.tokens.Cmp(full) > 0 {
+					o.tokens.Set(full)
 				}
 			}
-			want := event.Cost > 0 && int64(event.Cost) <= int64(trace.Config.Cap)-unresolved
-			got := subject.ledger.admit(int64(event.Cost), int64(trace.Config.Cap))
-			if got != want {
-				return fail(index, "admission=%v, oracle=%v", got, want)
+		case "AllowN":
+			var outstanding int64
+			for _, r := range oracle.receipts {
+				if !r.acknowledged {
+					outstanding += r.cost
+				}
+			}
+			want := event.Cost > 0 && event.Cost <= cfg.LocalBurst && event.Cost <= cfg.Cap && oracle.initialized && !oracle.rejected && nowNS < oracle.freshNS && int64(event.Cost) <= int64(cfg.Cap)-outstanding && oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) >= 0
+			wantReason := ReasonAllowed
+			switch {
+			case event.Cost <= 0 || event.Cost > cfg.LocalBurst || event.Cost > cfg.Cap:
+				wantReason = ReasonInvalidRequest
+			case oracle.rejected:
+				wantReason = ReasonGlobalLimit
+			case !oracle.initialized:
+				wantReason = ReasonSyncPending
+			case nowNS >= oracle.freshNS:
+				wantReason = ReasonRedisUnavailable
+			case int64(event.Cost) > int64(cfg.Cap)-outstanding:
+				wantReason = ReasonSyncPending
+			case oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) < 0:
+				wantReason = ReasonLocalLimit
+			}
+			got, reason, _ := subject.limiter.AllowN(id.key, event.Cost)
+			if got != want || reason != wantReason {
+				return fail(index, "admission=%v reason=%s oracle=%v expectedReason="+wantReason+" tokens=%s outstanding=%d", got, reason, want, oracle.tokens.String(), outstanding)
 			}
 			if want {
 				oracle.receipts = append(oracle.receipts, modelReceipt{cost: int64(event.Cost)})
+				oracle.tokens.Sub(oracle.tokens, big.NewRat(int64(event.Cost), 1))
 				subject.accepted += int64(event.Cost)
 			}
 		case "BeginAttempt", "RetrySameBatch":
-			if event.Attempt == 0 || attempts[event.Attempt] != nil {
-				return fail(index, "attempt identity must be new and nonzero")
+			if event.Attempt == 0 || attempts[event.Attempt] != nil || oracle.busy != 0 || !oracle.initialized {
+				return fail(index, "invalid attempt identity/state")
 			}
 			if event.Kind == "RetrySameBatch" && oracle.flight == 0 {
 				return fail(index, "retry without flight")
 			}
 			if oracle.flight == 0 {
 				var pending int64
-				for _, receipt := range oracle.receipts {
-					if receipt.sequence == 0 {
-						pending += receipt.cost
+				for _, r := range oracle.receipts {
+					if r.sequence == 0 {
+						pending += r.cost
 					}
 				}
-				if pending == 0 {
-					return fail(index, "begin without pending consumption")
-				}
-				oracle.latestBatch++
-				oracle.flight = oracle.latestBatch
-				for i := range oracle.receipts {
-					if oracle.receipts[i].sequence == 0 {
-						oracle.receipts[i].sequence = oracle.flight
-					}
-				}
-			}
-			payload, ok := subject.ledger.begin()
-			var expectedDelta int64
-			for _, receipt := range oracle.receipts {
-				if receipt.sequence == oracle.flight {
-					expectedDelta += receipt.cost
-				}
-			}
-			if !ok || payload.Sequence != oracle.flight || payload.Delta != expectedDelta {
-				return fail(index, "batch=%+v,%v; oracle sequence=%d delta=%d", payload, ok, oracle.flight, expectedDelta)
-			}
-			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: payload, sequence: oracle.flight}
-		case "ExecuteRedis":
-			attempt := attempts[event.Attempt]
-			if attempt == nil || attempt.owner != id || attempt.executed || attempt.finished {
-				return fail(index, "invalid execution")
-			}
-			// Controlled backend: executes the production payload, deduplicating the
-			// sequence as Redis will. The oracle never reads this payload or counters.
-			payload := attempt.payload
-			if payload.Sequence == subject.remoteSequence+1 {
-				subject.applied += payload.Delta
-				subject.remoteSequence, subject.remoteDelta = payload.Sequence, payload.Delta
-			} else if payload.Sequence != subject.remoteSequence || payload.Delta != subject.remoteDelta {
-				return fail(index, "invalid foundation execution order")
-			}
-			for i := range oracle.receipts {
-				if oracle.receipts[i].sequence == attempt.sequence {
-					oracle.receipts[i].applied = true
-				}
-			}
-			attempt.executed = true
-		case "DeliverReply", "LoseReply":
-			attempt := attempts[event.Attempt]
-			if attempt == nil || attempt.owner != id || !attempt.executed || attempt.finished {
-				return fail(index, "invalid reply transition")
-			}
-			if event.Kind == "DeliverReply" {
-				want := oracle.flight == attempt.sequence
-				if got := subject.ledger.acknowledge(attempt.payload); got != want {
-					return fail(index, "ack=%v, oracle=%v", got, want)
-				}
-				if want {
+				if pending > 0 {
+					oracle.latestBatch++
+					oracle.flight = oracle.latestBatch
 					for i := range oracle.receipts {
-						if oracle.receipts[i].sequence == attempt.sequence {
-							oracle.receipts[i].acknowledged = true
+						if oracle.receipts[i].sequence == 0 {
+							oracle.receipts[i].sequence = oracle.flight
 						}
 					}
-					oracle.acknowledged, oracle.flight = attempt.sequence, 0
 				}
 			}
-			attempt.finished = true
+			a, ok := subject.limiter.prepareAttempt(subject.bucket, clocks[id.instance].Now())
+			if !ok {
+				return fail(index, "attempt rejected")
+			}
+			var delta int64
+			for _, r := range oracle.receipts {
+				if oracle.flight != 0 && r.sequence == oracle.flight {
+					delta += r.cost
+				}
+			}
+			if a.batch.Sequence != oracle.flight || a.batch.Delta != delta {
+				return fail(index, "batch=%+v oracle sequence=%d delta=%d", a.batch, oracle.flight, delta)
+			}
+			wantCommand := command{Op: opRefresh, Session: fmt.Sprintf("%032x", id.instance+1), Slot: oracle.slot, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
+			if delta > 0 {
+				wantCommand.Op, wantCommand.Sequence, wantCommand.Delta = opApply, oracle.flight, delta
+			}
+			if a.command != wantCommand {
+				return fail(index, "command=%+v oracle=%+v", a.command, wantCommand)
+			}
+			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: a, sequence: oracle.flight}
+			oracle.busy = event.Attempt
+		case "ExecuteRedis":
+			a := attempts[event.Attempt]
+			if a == nil || a.owner != id || a.executed || a.finished {
+				return fail(index, "invalid execution")
+			}
+			a.response = execute(remotes[id.key], a.payload.command, start.UnixMilli()+nowNS/int64(time.Millisecond))
+			if a.response.Outcome != outcomeOK && a.response.Outcome != outcomeDuplicate {
+				return fail(index, "backend rejected %+v", a.response)
+			}
+			if a.sequence != 0 {
+				for i := range oracle.receipts {
+					if oracle.receipts[i].sequence == a.sequence {
+						oracle.receipts[i].applied = true
+					}
+				}
+			}
+			a.executed = true
+		case "TimeoutAttempt":
+			a := attempts[event.Attempt]
+			if a == nil || a.owner != id || a.finished || a.timedOut || oracle.busy != event.Attempt {
+				return fail(index, "invalid timeout")
+			}
+			subject.limiter.finishAttempt(subject.bucket, a.payload)
+			a.timedOut = true
+			oracle.busy = 0
+		case "DeliverReply", "LoseReply":
+			a := attempts[event.Attempt]
+			if a == nil || a.owner != id || !a.executed || a.finished {
+				return fail(index, "invalid reply transition")
+			}
+			if event.Kind == "LoseReply" {
+				subject.limiter.finishAttempt(subject.bucket, a.payload)
+				if oracle.busy == event.Attempt {
+					oracle.busy = 0
+				}
+			} else {
+				subject.limiter.installReply(subject.bucket, a.payload, a.response)
+				if !a.timedOut && oracle.busy == event.Attempt {
+					if a.sequence != 0 && oracle.flight == a.sequence {
+						for i := range oracle.receipts {
+							if oracle.receipts[i].sequence == a.sequence {
+								oracle.receipts[i].acknowledged = true
+							}
+						}
+						oracle.acknowledged, oracle.flight = a.sequence, 0
+					}
+					oracle.rejected = a.response.BalanceU < 1e6
+					oracle.freshNS = a.payload.start.Sub(start).Nanoseconds() + cfg.FreshnessNS
+					oracle.busy = 0
+				}
+			}
+			a.finished = true
 		default:
 			return fail(index, "unsupported foundation event %q", event.Kind)
 		}
+		totals := map[string]int64{}
 		for id, subject := range subjects {
-			oracle := oracles[id]
+			o := oracles[id]
 			var accepted, applied, unapplied, pending, outstanding, flight int64
-			for _, receipt := range oracle.receipts {
-				accepted += receipt.cost
-				if receipt.applied {
-					applied += receipt.cost
+			for _, r := range o.receipts {
+				accepted += r.cost
+				if r.applied {
+					applied += r.cost
 				} else {
-					unapplied += receipt.cost
+					unapplied += r.cost
 				}
-				if !receipt.acknowledged {
-					outstanding += receipt.cost
+				if !r.acknowledged {
+					outstanding += r.cost
 				}
-				if receipt.sequence == 0 {
-					pending += receipt.cost
+				if r.sequence == 0 {
+					pending += r.cost
 				}
-				if oracle.flight != 0 && receipt.sequence == oracle.flight {
-					flight += receipt.cost
+				if o.flight != 0 && r.sequence == o.flight {
+					flight += r.cost
 				}
-				if receipt.acknowledged && !receipt.applied {
-					return fail(index, "oracle acknowledged unapplied consumption")
+				if r.acknowledged && !r.applied {
+					return fail(index, "acknowledged unapplied receipt")
 				}
 			}
-			l := &subject.ledger
-			if accepted != applied+unapplied || subject.accepted != accepted || subject.applied != applied || subject.accepted != subject.applied+unapplied {
-				return fail(index, "conservation: accepted=%d/%d applied=%d/%d unapplied=%d", subject.accepted, accepted, subject.applied, applied, unapplied)
+			actualApplied := remotes[id.key].applied[fmt.Sprintf("%032x", id.instance+1)]
+			if actualApplied != applied || subject.accepted != actualApplied+unapplied {
+				return fail(index, "backend accounting: applied=%d receipts=%d accepted=%d unapplied=%d", actualApplied, applied, subject.accepted, unapplied)
 			}
-			if l.Pending != pending || l.outstanding() != outstanding || outstanding < 0 || outstanding > int64(trace.Config.Cap) || l.Committed != oracle.acknowledged {
-				return fail(index, "ledger=%+v outstanding=%d; oracle pending=%d outstanding=%d committed=%d", *l, l.outstanding(), pending, outstanding, oracle.acknowledged)
+			b := subject.bucket
+			b.mu.Lock()
+			l := b.ledger
+			var f batch
+			if l.Flight != nil {
+				f = *l.Flight
 			}
-			if (l.Flight == nil) != (oracle.flight == 0) || (l.Flight != nil && (l.Flight.Sequence != oracle.flight || l.Flight.Delta != flight)) {
-				return fail(index, "flight=%+v; oracle sequence=%d delta=%d", l.Flight, oracle.flight, flight)
+			hasFlight := l.Flight != nil
+			b.mu.Unlock()
+			if accepted != applied+unapplied || subject.accepted != accepted || l.Pending != pending || l.outstanding() != outstanding || outstanding < 0 || outstanding > int64(cfg.Cap) || l.Committed != o.acknowledged || hasFlight != (o.flight != 0) || (hasFlight && (f.Sequence != o.flight || f.Delta != flight)) {
+				return fail(index, "conservation/cap ledger=%+v oracle accepted=%d applied=%d unapplied=%d pending=%d outstanding=%d flight=%d", l, accepted, applied, unapplied, pending, outstanding, flight)
+			}
+			totals[id.key] += accepted
+		}
+		// Compare every pair of event boundaries in physical time. All intermediate
+		// arithmetic is independent arbitrary precision, including the 1ms allowance.
+		for _, prior := range boundaries {
+			for key, total := range totals {
+				used := new(big.Int).Mul(big.NewInt(total-prior.totals[key]), big.NewInt(1_000_000_000_000_000))
+				bound := new(big.Int).Mul(big.NewInt(int64(cfg.Burst+2*cfg.Instances*cfg.Cap)), big.NewInt(1_000_000_000_000_000))
+				bound.Add(bound, new(big.Int).Mul(big.NewInt(cfg.RateU), big.NewInt(nowNS-prior.ns+1_000_000)))
+				bound.Add(bound, big.NewInt(1_000_000_000))
+				if used.Cmp(bound) > 0 {
+					return fail(index, "normal envelope violated key=%q admitted=%d intervalNS=%d", key, total-prior.totals[key], nowNS-prior.ns)
+				}
 			}
 		}
+		boundaries = append(boundaries, envelopeBoundary{ns: nowNS, totals: totals})
 	}
 	return nil
 }
@@ -258,9 +406,11 @@ func checkTrace(trace modelTrace) error {
 func TestStateMachineFoundationDelayedDuplicateAck(t *testing.T) {
 	trace := modelTrace{Config: modelConfig{Instances: 1, Cap: 5}, Events: []modelEvent{
 		{Kind: "CreateKey", Key: "k"},
+		{Kind: "Initialize", Key: "k"},
 		{Kind: "AllowN", Key: "k", Cost: 3},
 		{Kind: "BeginAttempt", Key: "k", Attempt: 1},
 		{Kind: "ExecuteRedis", Key: "k", Attempt: 1},
+		{Kind: "TimeoutAttempt", Key: "k", Attempt: 1},
 		{Kind: "RetrySameBatch", Key: "k", Attempt: 2},
 		{Kind: "ExecuteRedis", Key: "k", Attempt: 2},
 		{Kind: "DeliverReply", Key: "k", Attempt: 2},
@@ -283,6 +433,7 @@ type redisReference struct {
 	balanceNumerator *big.Int
 	logical          int64
 	sessions         map[string]referenceSession
+	applied          map[string]int64 // Unique whole-token deductions, keyed by actual session.
 }
 type referenceSession struct {
 	slot               int
@@ -293,6 +444,7 @@ type referenceSession struct {
 func (m *redisReference) execute(c command, now int64) reply {
 	if m.sessions == nil {
 		m.sessions = make(map[string]referenceSession)
+		m.applied = make(map[string]int64)
 		m.balanceNumerator = new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
 		m.logical = now
 	}
@@ -325,6 +477,7 @@ func (m *redisReference) execute(c command, now int64) reply {
 				code = outcomeDuplicate
 			} else if c.Sequence == s.sequence+1 {
 				balance.Sub(balance, new(big.Int).Mul(big.NewInt(c.Delta), big.NewInt(1_000_000_000)))
+				m.applied[c.Session] += c.Delta
 				s.sequence, s.delta = c.Sequence, c.Delta
 			} else {
 				return reply{Outcome: outcomeSequenceError}
@@ -463,5 +616,22 @@ func TestStateMachineFoundationRedisNumericDifferential(t *testing.T) {
 				compare(c, now+elapsed)
 			}
 		})
+	}
+}
+
+func TestStateMachineFoundationDetectsBackendUndercharge(t *testing.T) {
+	trace := modelTrace{Config: modelConfig{Instances: 1, Cap: 5}, Events: []modelEvent{
+		{Kind: "CreateKey", Key: "k"}, {Kind: "Initialize", Key: "k"},
+		{Kind: "AllowN", Key: "k", Cost: 3}, {Kind: "BeginAttempt", Key: "k", Attempt: 1},
+		{Kind: "ExecuteRedis", Key: "k", Attempt: 1},
+	}}
+	err := checkTraceWithExecution(trace, func(remote *redisReference, c command, now int64) reply {
+		if c.Op == opApply {
+			c.Delta = 1
+		}
+		return remote.execute(c, now)
+	})
+	if err == nil || !strings.Contains(err.Error(), "backend accounting: applied=1 receipts=3") {
+		t.Fatalf("undercharged backend was not detected by conservation: %v", err)
 	}
 }

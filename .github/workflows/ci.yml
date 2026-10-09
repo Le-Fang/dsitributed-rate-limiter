@@ -29,6 +29,9 @@ jobs:
         timeout-minutes: 3
       - run: go test -timeout 3m ./...
         timeout-minutes: 5
+      - run: go test -race -timeout 3m ./...
+        if: matrix.go == '1.27.x'
+        timeout-minutes: 5
       - run: go vet ./...
         timeout-minutes: 3
 

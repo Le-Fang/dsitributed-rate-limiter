@@ -2,6 +2,7 @@ package ratelimiter
 
 import (
 	"math"
+	"sync"
 	"time"
 )
 
@@ -138,4 +139,29 @@ func laterFullDeadline(previous time.Time, tooFar bool, now time.Time, rate floa
 		return at, false
 	}
 	return previous, false
+}
+
+// bucket owns one incarnation of a key. Callers retain a store reference while
+// accessing it. The mutex couples local spending, the ledger and authorization.
+type bucket struct {
+	mu                    sync.Mutex
+	key                   string
+	refs                  int     // shard lock
+	next, prev            *bucket // shard lock
+	tokens                tokenBucket
+	ledger                ledger
+	created, lastActivity time.Time
+	initialized           bool
+	init                  *command // immutable registration identity/deadline, staged by worker
+	session               string
+	slot                  int
+	freshUntil            time.Time
+	authorizedGeneration  uint64
+	globalRejected        bool
+	retryAt               time.Time
+	terminalReason        string
+	capacityUntil         time.Time
+	busy, queued          bool
+	attemptID             uint64
+	active                attempt
 }

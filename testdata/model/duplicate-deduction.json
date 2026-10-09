@@ -17,6 +17,11 @@
       "Key": "k"
     },
     {
+      "Kind": "Initialize",
+      "Instance": 0,
+      "Key": "k"
+    },
+    {
       "Kind": "AllowN",
       "Instance": 0,
       "Key": "k",
