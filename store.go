@@ -9,11 +9,18 @@ import (
 
 const shardCount = 64
 
-// Lock order: scanMu -> shard.mu -> bucket.mu. Admission/attempt code only
+// Lock order: scanMu -> shard.mu -> bucket.mu. The creation-only birthMu
+// precedes shard.mu; the lookup fast path releases shard.mu before taking it.
+// Admission/attempt code only
 // takes bucket.mu; it must drop that lock before retaining/releasing references
 // or delivering callbacks. The linked lists make scan work independent of map
 // size. References and list links belong to the shard, all policy to the bucket.
 type bucketStore struct {
+	// Only the miss path joins observation transition ordering. These are wired
+	// before publication by the application constructor; standalone stores omit it.
+	birthMu       *sync.Mutex
+	control       *atomic.Pointer[controlState]
+	clock         clock
 	shards        [shardCount]storeShard
 	count         atomic.Int64
 	max           int64
@@ -53,11 +60,24 @@ func shardIndex(key string) uint64 {
 func (s *bucketStore) acquire(key string, now time.Time) (*bucket, bool) {
 	sh := &s.shards[shardIndex(key)]
 	sh.mu.Lock()
+	if b := sh.keys[key]; b != nil {
+		b.refs++
+		sh.mu.Unlock()
+		return b, true
+	}
+	sh.mu.Unlock()
+	if s.birthMu != nil {
+		s.birthMu.Lock()
+		defer s.birthMu.Unlock()
+		now = s.clock.Now()
+	}
+	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if b := sh.keys[key]; b != nil {
 		b.refs++
 		return b, true
 	}
+
 	for {
 		n := s.count.Load()
 		if n >= s.max {
@@ -73,6 +93,10 @@ func (s *bucketStore) acquire(key string, now time.Time) (*bucket, bool) {
 	// Track both refill deadlines from birth. Cleanup has no circuit knowledge;
 	// this conservatively retains normal keys through potential lazy outages.
 	b.tokens.fallbackRate, b.tokens.fallbackBurst = s.fallbackRate, s.fallbackBurst
+	if s.control != nil {
+		b.coldBaseline = s.control.Load().outageSampleAt(now)
+		b.coldStartedAt = now
+	}
 	if sh.head == nil {
 		b.next, b.prev = b, b
 		sh.head, sh.cursor, sh.cleanupCursor = b, b, b
@@ -125,7 +149,7 @@ func (s *bucketStore) scan(limit int) []*bucket {
 	}
 	return out
 }
-func (s *bucketStore) cleanup(now time.Time, limit int) {
+func (s *bucketStore) cleanup(now time.Time, limit int) (removed []*bucket) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	visited, empty := 0, 0
@@ -160,10 +184,12 @@ func (s *bucketStore) cleanup(now time.Time, limit int) {
 					sh.cursor = b.next
 				}
 			}
+			removed = append(removed, b)
 			delete(sh.keys, b.key)
 			s.count.Add(-1)
 		}
 		b.mu.Unlock()
 		sh.mu.Unlock()
 	}
+	return removed
 }

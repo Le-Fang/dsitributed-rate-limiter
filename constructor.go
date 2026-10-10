@@ -11,7 +11,13 @@ func NewLimiter(cfg Config) (*Limiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := newLimiterCore(c.core(), c.Parent, realClock{}, b, c.Metrics)
+	m := c.Metrics
+	if m == nil {
+		m = NewPrometheusMetrics()
+	}
+	l := newLimiterCore(c.core(), c.Parent, realClock{}, b, m)
+	l.exposeMetrics = c.Metrics == nil
+	l.events = newEventLogger(c.Logger, l.clock, l.addCounter)
 	l.start()
 	return l, nil
 }

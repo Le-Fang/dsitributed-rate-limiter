@@ -92,36 +92,68 @@ func newSessionID() (string, error) {
 	return hex.EncodeToString(bits[:]), nil
 }
 
-// classifyBackendError owns Redis-specific interpretation. Exact RESP error
+// classifyRedisFailure owns all Redis-specific interpretation. Exact RESP
 // codes form an allowlist; unknown errors fail closed at the dependency level.
-func classifyBackendError(err error) errorClass {
+func classifyRedisFailure(err error) (errorClass, backendDiagnostic) {
 	if errors.Is(err, context.Canceled) {
-		return errorShutdown
+		return errorShutdown, diagnosticUnknown
 	}
 	if errors.Is(err, errMalformedReply) {
-		return errorPermanent
+		return errorPermanent, diagnosticProtocol
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, redis.ErrPoolTimeout) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return errorTransient
+	if errors.Is(err, redis.ErrPoolTimeout) {
+		return errorTransient, diagnosticPoolExhausted
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errorTransient, diagnosticTimeout
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return errorTransient, diagnosticNetwork
 	}
 	var wire redis.Error
 	if errors.As(err, &wire) {
 		code, _, _ := strings.Cut(wire.Error(), " ")
 		switch code {
-		case "LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN", "BUSY", "READONLY", "OOM":
-			return errorTransient
+		case "LOADING":
+			return errorTransient, diagnosticLoading
+		case "TRYAGAIN":
+			return errorTransient, diagnosticTryAgain
+		case "CLUSTERDOWN":
+			return errorTransient, diagnosticClusterDown
+		case "MASTERDOWN":
+			return errorTransient, diagnosticMasterDown
+		case "BUSY":
+			return errorTransient, diagnosticBusy
+		case "READONLY":
+			return errorTransient, diagnosticReadOnly
+		case "OOM":
+			return errorTransient, diagnosticOOM
+		case "NOAUTH", "WRONGPASS":
+			return errorPermanent, diagnosticAuthentication
+		case "NOPERM":
+			return errorPermanent, diagnosticPermission
+		case "ERR", "NOSCRIPT":
+			return errorPermanent, diagnosticScript
 		}
-		return errorPermanent
+		return errorPermanent, diagnosticUnknown
 	}
 	var network net.Error
 	if errors.As(err, &network) {
-		return errorTransient
+		if network.Timeout() {
+			return errorTransient, diagnosticTimeout
+		}
+		return errorTransient, diagnosticNetwork
 	}
-	return errorPermanent
+	return errorPermanent, diagnosticUnknown
+}
+func classifyBackendError(err error) errorClass {
+	class, _ := classifyRedisFailure(err)
+	return class
 }
 func classifyRedisError(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &backendError{class: classifyBackendError(err), cause: err}
+	class, diagnostic := classifyRedisFailure(err)
+	return &backendError{class: class, diagnostic: diagnostic, cause: err}
 }

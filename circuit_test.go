@@ -381,10 +381,17 @@ func TestFallbackSnapshotRetryDoesNotCreditNormalRefill(t *testing.T) {
 	initializeTestBucket(t, l, b, 20e6)
 	l.AllowN("k", 5)
 	c.Advance(500 * time.Millisecond)
-	l.clock = &decisionClock{clock: c, change: func() { l.recordFailure(transientFailure()) }}
+	failed := make(chan struct{})
+	l.clock = &decisionClock{clock: c, change: func() {
+		// Failure publishes concurrently with the held admission bucket. Waiting
+		// for the whole background transition here would reenter that same mutex.
+		go func() { l.recordFailure(transientFailure()); close(failed) }()
+		eventually(t, func() bool { return l.control.Load().circuit == circuitOpen })
+	}}
 	if ok, r, i := l.Allow("k"); !ok || r != ReasonLocalFallback || i.Remaining != 0 {
 		t.Fatalf("snapshot retry minted refill: %v %s %+v", ok, r, i)
 	}
+	<-failed
 }
 func TestFallbackCleanupUnobservedOutage(t *testing.T) {
 	cfg := fallbackConfig(LocalOnly)

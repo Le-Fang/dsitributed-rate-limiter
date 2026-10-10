@@ -93,3 +93,26 @@ func protocolResult(r reply, unresolved bool) protocolDisposition {
 	}
 	return protocolDisposition{Reason: ReasonAccountingError, Terminal: true}
 }
+
+// backendDiagnostic is a finite, sanitized application value. Only adapters
+// inspect transport error text; observation never retains arbitrary strings.
+type backendDiagnostic uint8
+
+const (
+	diagnosticUnknown backendDiagnostic = iota
+	diagnosticTimeout
+	diagnosticPoolExhausted
+	diagnosticNetwork
+	diagnosticOOM
+	diagnosticAuthentication
+	diagnosticPermission
+	diagnosticProtocol
+	diagnosticScript
+	diagnosticLoading
+	diagnosticTryAgain
+	diagnosticClusterDown
+	diagnosticMasterDown
+	diagnosticBusy
+	diagnosticReadOnly
+	diagnosticCount
+)

@@ -144,27 +144,42 @@ func laterFullDeadline(previous time.Time, tooFar bool, now time.Time, rate floa
 // bucket owns one incarnation of a key. Callers retain a store reference while
 // accessing it. The mutex couples local spending, the ledger and authorization.
 type bucket struct {
-	mu                    sync.Mutex
-	key                   string
-	refs                  int     // shard lock
-	next, prev            *bucket // shard lock
-	tokens                tokenBucket
-	ledger                ledger
-	created, lastActivity time.Time
-	initialized           bool
-	fallback              bool     // recovery mode, even when policy parameters are equal
-	init                  *command // immutable registration identity/deadline, staged by worker
-	session               string
-	slot                  int
-	freshUntil            time.Time
-	nextSyncAt            time.Time
-	authorizedGeneration  uint64
-	checkedGeneration     uint64 // last successful balance observation, including rejection
-	globalRejected        bool
-	retryAt               time.Time
-	terminalReason        string
-	capacityUntil         time.Time
-	busy, queued          bool
-	attemptID             uint64
-	active                attempt
+	mu                        sync.Mutex
+	key                       string
+	refs                      int     // shard lock
+	next, prev                *bucket // shard lock
+	tokens                    tokenBucket
+	ledger                    ledger
+	created, lastActivity     time.Time
+	initialized               bool
+	fallback                  bool     // recovery mode, even when policy parameters are equal
+	init                      *command // immutable registration identity/deadline, staged by worker
+	session                   string
+	slot                      int
+	freshUntil                time.Time
+	nextSyncAt                time.Time
+	authorizedGeneration      uint64
+	checkedGeneration         uint64 // last successful balance observation, including rejection
+	globalRejected            bool
+	retryAt                   time.Time
+	terminalReason            string
+	capacityUntil             time.Time
+	busy, queued              bool
+	attemptID                 uint64
+	active                    attempt
+	epoch                     *authorizationEpoch
+	pendingSince, flightSince time.Time
+	queuedAt                  time.Time
+	expiryObserved            time.Time
+	observedFallback          bool
+	fallbackObservedAt        time.Time
+	observationStopped        bool
+	unavailableAt             time.Time
+	terminalAt                time.Time
+	coldBaseline, coldCutoff  outageSample
+	coldCutoffKnown           bool
+	coldStartedAt             time.Time
+	coldObservedAt            time.Time
+	coldAccountedSeconds      float64
+	coldEntries, coldExits    uint64
 }

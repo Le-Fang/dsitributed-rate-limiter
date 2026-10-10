@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -197,13 +198,12 @@ func TestLimiterNewConstructorCold(t *testing.T) {
 // read but before the decision commits. No production test hook is necessary.
 type decisionClock struct {
 	clock
-	count  int
+	count  atomic.Int64
 	change func()
 }
 
 func (c *decisionClock) Now() time.Time {
-	c.count++
-	if c.count == 2 {
+	if c.count.Add(1) == 2 {
 		c.change()
 	}
 	return c.clock.Now()

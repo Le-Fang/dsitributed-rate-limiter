@@ -25,6 +25,9 @@ type Limiter struct {
 	clock             clock
 	backend           backend
 	metrics           Metrics
+	exposeMetrics     bool
+	observations      observations
+	events            eventSink
 	store             *bucketStore
 	control           atomic.Pointer[controlState]
 	work              chan *bucket
@@ -49,7 +52,10 @@ func newLimiterCore(c coreConfig, parent context.Context, clock clock, b backend
 	l := &Limiter{cfg: c, parent: parent, clock: clock, backend: b, metrics: m, store: newBucketStore(c), work: make(chan *bucket, 1024), workersDone: make(chan struct{}), shutdownDone: make(chan struct{}), shutdownContext: func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), shutdownBudget)
 	}, jitter: fullJitter}
-	l.control.Store(&controlState{generation: 1})
+	l.control.Store(&controlState{generation: 1, epoch: &authorizationEpoch{}})
+	l.store.birthMu = &l.observations.transitionMu
+	l.store.control = &l.control
+	l.store.clock = clock
 	return l
 }
 func (l *Limiter) Allow(key string) (bool, string, LimitInfo) { return l.AllowN(key, 1) }
@@ -67,6 +73,7 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 		return l.observe(false, ReasonCapacityExhausted, info)
 	}
 	b.mu.Lock()
+	l.observeBucketLocked(b, l.clock.Now())
 	var reason string
 	var allowed, notify bool
 	for {
@@ -164,6 +171,9 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 		if allowed {
 			b.tokens.take(n)
 			if info.Mode == ModeNormal {
+				if b.ledger.Pending == 0 {
+					b.pendingSince = now
+				}
 				b.ledger.admit(int64(n), int64(l.cfg.maxOutstanding))
 			}
 			info.Remaining = int(b.tokens.tokens)
@@ -171,7 +181,9 @@ func (l *Limiter) AllowN(key string, n int) (bool, string, LimitInfo) {
 		}
 		break
 	}
+	l.observeBucketLocked(b, l.clock.Now())
 	b.mu.Unlock()
+	l.flushObservations()
 	if notify {
 		l.notify(b)
 	}
@@ -189,12 +201,16 @@ func (l *Limiter) bucketInfo(b *bucket) LimitInfo {
 	return i
 }
 func (l *Limiter) observe(ok bool, reason string, info LimitInfo) (bool, string, LimitInfo) {
-	if l.metrics != nil {
-		name := "rejected_total"
-		if ok {
-			name = "allowed_total"
-		}
-		l.metrics.AddCounter(name, Labels{Tier: info.Tier, Reason: reason}, 1)
+	name := MetricRejected
+	if ok {
+		name = MetricAllowed
+	}
+	l.addCounter(name, Labels{Tier: info.Tier, Reason: reason}, 1)
+	if reason == ReasonLocalFallback {
+		l.addCounter(MetricFallbackAllowed, Labels{}, 1)
+	}
+	if reason == ReasonFallbackLimit {
+		l.addCounter(MetricFallbackRejected, Labels{}, 1)
 	}
 	return ok, reason, info
 }
@@ -202,6 +218,15 @@ func (l *Limiter) observe(ok bool, reason string, info LimitInfo) (bool, string,
 // notify owns a reference only on successful enqueue. Saturation loses a hint,
 // never accounting; the scheduler's bounded scans rediscover work.
 func (l *Limiter) notify(b *bucket) {
+	var coalesced, dropped bool
+	defer func() {
+		if coalesced {
+			l.addCounter(MetricNotificationsCoalesced, Labels{}, 1)
+		}
+		if dropped {
+			l.addCounter(MetricNotificationsDropped, Labels{}, 1)
+		}
+	}()
 	// Register the entire reference transfer with shutdown, including senders
 	// paused after their parent check. Shutdown closes this gate before drain.
 	l.enqueueMu.RLock()
@@ -214,15 +239,18 @@ func (l *Limiter) notify(b *bucket) {
 	}
 	b.mu.Lock()
 	if b.queued || b.busy || b.terminalReason != "" || l.parent.Err() != nil || l.control.Load().closed {
+		coalesced = b.queued || b.busy
 		b.mu.Unlock()
 		l.store.release(b)
 		return
 	}
 	b.queued = true
+	b.queuedAt = l.clock.Now()
 	b.mu.Unlock()
 	select {
 	case l.work <- b:
 	default:
+		dropped = true
 		b.mu.Lock()
 		b.queued = false
 		b.mu.Unlock()
@@ -249,6 +277,10 @@ func (l *Limiter) prepareAttempt(b *bucket, now time.Time) (attempt, bool) {
 		// A zero operation claims the same ownership while sampling TIME.
 	} else {
 		c = command{Session: b.session, Slot: b.slot, RateU: l.cfg.globalRateU, BurstU: int64(l.cfg.globalBurst) * 1e6}
+		if b.ledger.Flight == nil && b.ledger.Pending > 0 {
+			b.flightSince = b.pendingSince
+			b.pendingSince = time.Time{}
+		}
 		if p, ok := b.ledger.begin(); ok {
 			payload = p
 			c.Op, c.Sequence, c.Delta = opApply, p.Sequence, p.Delta
@@ -277,8 +309,14 @@ func (l *Limiter) finishAttempt(b *bucket, a attempt) {
 	}
 }
 func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
+	var terminal string
+	// Registered before lock cleanup: user callbacks run only after unlocking.
+	defer func() { l.observeTerminalTransition(terminal) }()
+	defer l.flushObservations()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	l.observeBucketLocked(b, l.clock.Now())
+	defer func() { l.observeBucketLocked(b, l.clock.Now()) }()
 	if !b.busy || b.active != a {
 		return
 	}
@@ -290,6 +328,7 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 			success = false
 		} else {
 			b.ledger.acknowledge(a.batch)
+			b.flightSince = time.Time{}
 		}
 	}
 	s := l.control.Load()
@@ -300,8 +339,10 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 	}
 	d := protocolResult(r, b.ledger.outstanding() != 0)
 	if !success {
-		if d.Terminal {
+		if d.Terminal && b.terminalReason == "" {
+			terminal = d.Reason
 			b.terminalReason = d.Reason
+			b.terminalAt = l.clock.Now()
 		}
 		if d.Reinitialize {
 			// Reinitialization is permitted only with no unresolved receipts.
@@ -311,6 +352,7 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 			b.freshUntil = time.Time{}
 			b.session = ""
 			b.slot = -1
+			l.resetColdObservationLocked(b, s, l.clock.Now())
 		}
 		if d.RetryDelay > 0 {
 			b.capacityUntil = l.clock.Now().Add(d.RetryDelay)
@@ -344,6 +386,7 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 		return
 	}
 	b.authorizedGeneration = s.generation
+	b.epoch = s.epoch
 	ttl := durationMilliseconds(r.SessionTTLMS)
 	b.freshUntil = a.start.Add(min(l.cfg.maxSyncAge, max(time.Duration(0), ttl-time.Minute)))
 	if d.Authorized && b.fallback && now.Before(b.freshUntil) {

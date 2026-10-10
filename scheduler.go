@@ -66,7 +66,9 @@ func (l *Limiter) worker(ctx context.Context) {
 			}
 			b.mu.Lock()
 			b.queued = false
+			queuedAt := b.queuedAt
 			b.mu.Unlock()
+			l.observeDuration(MetricQueueDelay, max(0, l.clock.Now().Sub(queuedAt).Seconds()))
 			if ctx.Err() == nil && l.due(b, l.clock.Now()) {
 				if a, ok := l.prepareAttempt(b, l.clock.Now()); ok {
 					l.runAttempt(ctx, b, a)
@@ -114,11 +116,21 @@ func (l *Limiter) due(b *bucket, now time.Time) bool {
 // scanDue uses the store's persistent cursor and releases every scan reference.
 // Notifications hold separate references only while actually queued.
 func (l *Limiter) scanDue(now time.Time) {
+	defer l.maybeSampleMetrics(now)
 	s := l.control.Load()
 	if s.closed || l.parent.Err() != nil {
 		return
 	}
-	l.store.cleanup(now, scanChunk)
+	for _, b := range l.store.cleanup(now, scanChunk) {
+		b.mu.Lock()
+		l.observeBucketLocked(b, now)
+		if b.observedFallback {
+			b.observedFallback = false
+			l.observations.fallbackExit.Add(1)
+		}
+		b.mu.Unlock()
+	}
+	l.flushObservations()
 	if s.permanent {
 		return
 	}
@@ -135,6 +147,7 @@ func (l *Limiter) scanDue(now time.Time) {
 }
 
 func (l *Limiter) runAttempt(ctx context.Context, b *bucket, a attempt) {
+	defer l.beginObservedWork()()
 	if a.command.Op == 0 {
 		// Ownership is already claimed before TIME, preventing concurrent init
 		// samples for one key. Its deadline is based on the sample, never receipt.
@@ -217,6 +230,7 @@ func (l *Limiter) scheduleProbe(now time.Time) {
 	}
 }
 func (l *Limiter) runProbe(ctx context.Context) {
+	defer l.beginObservedWork()()
 	if !l.beginProbe() {
 		l.circuitMu.Lock()
 		l.probeQueued = false

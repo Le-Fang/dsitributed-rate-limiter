@@ -48,11 +48,18 @@ func (l *Limiter) Close(ctx context.Context) error {
 func (l *Limiter) beginShutdown() {
 	l.shutdownOnce.Do(func() {
 		ctx, cancel := l.shutdownContext()
+		l.observations.transitionMu.Lock()
 		l.circuitMu.Lock()
-		next := *l.control.Load()
+		previous := l.control.Load()
+		next := *previous
 		next.closed = true
+		if next.stoppedAt.IsZero() {
+			next.stoppedAt = l.clock.Now()
+		}
+		l.updateOutageTimeline(previous, &next)
 		l.control.Store(&next)
 		l.circuitMu.Unlock()
+		l.finishObservationTransition(previous)
 		l.enqueueMu.Lock()
 		l.schedulingStopped = true
 		l.enqueueMu.Unlock()
@@ -97,6 +104,10 @@ func (l *Limiter) shutdown(ctx context.Context, cancel context.CancelFunc) {
 	if cause != nil || keys != 0 {
 		l.shutdownErr = &ShutdownError{UnflushedKeys: keys, UnflushedTokens: tokens, cause: cause}
 	}
+	l.sampleMetrics()
+	if l.events != nil {
+		l.events.stop()
+	}
 	close(l.shutdownDone)
 }
 
@@ -118,6 +129,10 @@ func (l *Limiter) flushBucket(ctx context.Context, b *bucket) error {
 			b.mu.Unlock()
 			return errors.New("unresolved accounting cannot be flushed")
 		}
+		if b.ledger.Flight == nil && b.ledger.Pending > 0 {
+			b.flightSince = b.pendingSince
+			b.pendingSince = time.Time{}
+		}
 		p, ok := b.ledger.begin()
 		if !ok {
 			b.mu.Unlock()
@@ -128,10 +143,14 @@ func (l *Limiter) flushBucket(ctx context.Context, b *bucket) error {
 		opCtx, cancel := context.WithTimeout(ctx, l.cfg.operationTimeout)
 		r, err := l.backend.Execute(opCtx, b.key, c)
 		cancel()
+		if err != nil {
+			l.observeBackendError(err)
+		}
 		if err == nil {
 			if (r.Outcome == outcomeOK || r.Outcome == outcomeDuplicate) && r.CommittedSequence == p.Sequence {
 				b.mu.Lock()
 				b.ledger.acknowledge(p)
+				b.flightSince = time.Time{}
 				b.mu.Unlock()
 				continue
 			}
