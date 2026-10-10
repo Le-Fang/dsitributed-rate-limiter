@@ -84,8 +84,15 @@ func TestRedisBackendBoundedInjectedClient(t *testing.T) {
 	if err == nil || time.Since(start) > 250*time.Millisecond {
 		t.Fatalf("unbounded probe %v in %v", err, time.Since(start))
 	}
+	start = time.Now()
+	if _, err = b.Time(context.Background(), "blocked"); err == nil || time.Since(start) > 250*time.Millisecond {
+		t.Fatalf("unbounded keyed TIME %v in %v", err, time.Since(start))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	if _, err = b.Time(ctx, "canceled"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("keyed TIME cancellation: %v", err)
+	}
 	if err = b.Probe(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation: %v", err)
 	}
@@ -222,5 +229,54 @@ func TestRedisBackendErrorClassification(t *testing.T) {
 				t.Fatalf("boundary lost cause/class: %v", wrapped)
 			}
 		})
+	}
+}
+
+// A keyless clock is 100ms ahead of the selected owner's clock. The hook is
+// only the transport boundary; both commands must use the production key hash.
+type registrationClockHook struct {
+	t   *testing.T
+	key string
+}
+
+func (h registrationClockHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h registrationClockHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h registrationClockHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if _, ok := ctx.Deadline(); !ok {
+			h.t.Fatal("registration operation lacks deadline")
+		}
+		if cmd.Name() == "time" {
+			cmd.(*redis.TimeCmd).SetVal(time.UnixMilli(100100))
+			return nil
+		}
+		args := cmd.Args()
+		if len(args) < 4 || args[2] != 1 || args[3] != h.key {
+			h.t.Fatalf("registration not routed to INIT owner: %v", args)
+		}
+		if cmd.Name() == "eval" && args[1] == "return redis.call('TIME')" {
+			cmd.(*redis.Cmd).SetVal([]interface{}{"100", "0"})
+			return nil
+		}
+		cmd.(*redis.Cmd).SetVal([]interface{}{"OK", "0", "0", "1000000", "0", "86400000", "100000", "1", "1"})
+		return nil
+	}
+}
+func TestRedisRegistrationTimeHasKey(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	defer client.Close()
+	c, _ := normalizeConfig(Config{GlobalRate: 1, GlobalBurst: 1, Redis: RedisConfig{Client: client}})
+	key := "tenant:{raw-key}"
+	client.AddHook(registrationClockHook{t: t, key: redisKey(c.Redis.Prefix, key)})
+	b, _ := newRedisBackend(c)
+	now, err := b.Time(context.Background(), key)
+	if err != nil || now.UnixMilli() != 100000 {
+		t.Fatalf("sampled wrong owner clock: %v %v", now, err)
+	}
+	_, err = b.Execute(context.Background(), key, command{Op: opInit, Session: "0123456789abcdef0123456789abcdef", Slot: -1, Delta: 1, RateU: 1000000, BurstU: 1000000, RegistrationDeadlineMS: now.UnixMilli() + 30000})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

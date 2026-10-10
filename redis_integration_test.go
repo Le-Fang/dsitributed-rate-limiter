@@ -152,7 +152,7 @@ func TestRedisIntegrationSessionsAndClock(t *testing.T) {
 	c.RegistrationDeadlineMS = now
 	assertOutcome(t, evalProtocol(t, client, key, controlledLua(now), c), outcomeInitExpired)
 	c.RegistrationDeadlineMS = now + 30001
-	assertOutcome(t, evalProtocol(t, client, key, controlledLua(now), c), outcomeInvalidArgument)
+	assertOutcome(t, evalProtocol(t, client, key, controlledLua(now), c), outcomeInitExpired)
 	// A delayed original INIT cannot resurrect a slot after retention has elapsed.
 	old.Op, old.Slot, old.Sequence, old.Delta, old.RegistrationDeadlineMS = opInit, -1, 0, 10, now+30000
 	assertOutcome(t, evalProtocol(t, client, key, controlledLua(now+86400001), old), outcomeInitExpired)
@@ -360,7 +360,7 @@ func TestRedisIntegrationBackendNOSCRIPT(t *testing.T) {
 	defer b.Close()
 	key := "noscript"
 	t.Cleanup(func() { client.Del(context.Background(), redisKey(c.Redis.Prefix, key)) })
-	now, err := b.Time(context.Background())
+	now, err := b.Time(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,4 +460,22 @@ func TestRedisIntegrationInitRetryAndExpiryBounds(t *testing.T) {
 	if !reflect.DeepEqual(before, client.HGetAll(context.Background(), key).Val()) {
 		t.Fatal("overflow TTL mutated state")
 	}
+}
+
+func TestRedisIntegrationRegistrationClockDiscontinuity(t *testing.T) {
+	client, key := redisFixture(t)
+	const sample int64 = 100000
+	c := initCommand(t, client)
+	c.RegistrationDeadlineMS = sample + 30000
+	for _, now := range []int64{sample - 1, sample - 5, sample - 100, sample + 30000} {
+		r := evalProtocol(t, client, key, controlledLua(now), c)
+		if r.Outcome != outcomeInitExpired {
+			t.Fatalf("clock=%d: got %+v; want retriable INIT_EXPIRED", now, r)
+		}
+		if client.Exists(context.Background(), key).Val() != 0 {
+			t.Fatal("invalid window created state")
+		}
+	}
+	c.RegistrationDeadlineMS = sample - 100 + 30000
+	assertOutcome(t, evalProtocol(t, client, key, controlledLua(sample-100), c), outcomeOK)
 }

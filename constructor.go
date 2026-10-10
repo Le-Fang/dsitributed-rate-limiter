@@ -1,8 +1,7 @@
 package ratelimiter
 
-// NewLimiter validates and wires an embedded limiter without network I/O.
-// This intermediate implementation remains cold: background initialization and
-// synchronization are added in the scheduler task before production use.
+// NewLimiter validates and starts an embedded limiter. Construction does not
+// wait for Redis; each key initializes asynchronously before normal admission.
 func NewLimiter(cfg Config) (*Limiter, error) {
 	c, err := normalizeConfig(cfg)
 	if err != nil {
@@ -12,5 +11,7 @@ func NewLimiter(cfg Config) (*Limiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newLimiterCore(c.core(), c.Parent, realClock{}, b, c.Metrics), nil
+	l := newLimiterCore(c.core(), c.Parent, realClock{}, b, c.Metrics)
+	l.start()
+	return l, nil
 }

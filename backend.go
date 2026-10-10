@@ -55,7 +55,7 @@ func (r reply) authorizes() bool {
 }
 
 type backend interface {
-	Time(context.Context) (time.Time, error)
+	Time(context.Context, string) (time.Time, error)
 	Execute(context.Context, string, command) (reply, error)
 	Probe(context.Context) error
 	Close() error // Only the adapter's owned client is closed.

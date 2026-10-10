@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,11 +40,24 @@ func newRedisBackend(c normalizedConfig) (backend, error) {
 	}
 	return b, nil
 }
-func (b *redisBackend) Time(ctx context.Context) (time.Time, error) {
+func (b *redisBackend) Time(ctx context.Context, key string) (time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
-	value, err := b.client.Time(ctx).Result()
-	return value, classifyRedisError(err)
+	// Declaring the same derived key as INIT routes TIME to its Cluster owner.
+	// EVAL avoids a separate NOSCRIPT round trip for this tiny read-only script.
+	values, err := b.client.Eval(ctx, "return redis.call('TIME')", []string{redisKey(b.prefix, key)}).StringSlice()
+	if err != nil {
+		return time.Time{}, classifyRedisError(err)
+	}
+	if len(values) != 2 {
+		return time.Time{}, classifyRedisError(errMalformedReply)
+	}
+	seconds, secErr := strconv.ParseInt(values[0], 10, 64)
+	micros, microErr := strconv.ParseInt(values[1], 10, 64)
+	if secErr != nil || microErr != nil || seconds < 0 || micros < 0 || micros >= 1000000 {
+		return time.Time{}, classifyRedisError(errMalformedReply)
+	}
+	return time.Unix(seconds, micros*1000), nil
 }
 func (b *redisBackend) Probe(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, b.timeout)

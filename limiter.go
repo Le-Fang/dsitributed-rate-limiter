@@ -17,21 +17,32 @@ type attempt struct {
 
 // Limiter performs bounded local admission and asynchronous shared accounting.
 // The core retains policy and ports, never public Config or concrete adapters.
+// The enqueue gate precedes shard/bucket locks or circuitMu; shutdown releases
+// it before joining workers. No bucket/circuit holder enters the enqueue gate.
 type Limiter struct {
-	cfg       coreConfig
-	parent    context.Context
-	clock     clock
-	backend   backend
-	metrics   Metrics
-	store     *bucketStore
-	control   atomic.Pointer[controlState]
-	work      chan *bucket
-	circuitMu sync.Mutex
-	probe     *controlState // protected by circuitMu; outstanding probe ownership
+	cfg               coreConfig
+	parent            context.Context
+	clock             clock
+	backend           backend
+	metrics           Metrics
+	store             *bucketStore
+	control           atomic.Pointer[controlState]
+	work              chan *bucket
+	enqueueMu         sync.RWMutex // enqueue gate; never held during worker join or I/O
+	schedulingStopped bool         // protected by enqueueMu
+	circuitMu         sync.Mutex
+	probe             *controlState // protected by circuitMu; outstanding probe ownership
+	startOnce         sync.Once
+	cancelWorkers     context.CancelFunc
+	workersDone       chan struct{}
+	jitter            func(time.Duration) time.Duration // fixed before start; circuitMu serializes use
+	probeQueued       bool                              // following recovery fields protected by circuitMu
+	nextProbeAt       time.Time
+	probeBackoff      time.Duration
 }
 
 func newLimiterCore(c coreConfig, parent context.Context, clock clock, b backend, m Metrics) *Limiter {
-	l := &Limiter{cfg: c, parent: parent, clock: clock, backend: b, metrics: m, store: newBucketStore(c), work: make(chan *bucket, 1024)}
+	l := &Limiter{cfg: c, parent: parent, clock: clock, backend: b, metrics: m, store: newBucketStore(c), work: make(chan *bucket, 1024), workersDone: make(chan struct{}), jitter: fullJitter}
 	l.control.Store(&controlState{generation: 1})
 	return l
 }
@@ -185,11 +196,18 @@ func (l *Limiter) observe(ok bool, reason string, info LimitInfo) (bool, string,
 // notify owns a reference only on successful enqueue. Saturation loses a hint,
 // never accounting; the scheduler's bounded scans rediscover work.
 func (l *Limiter) notify(b *bucket) {
+	// Register the entire reference transfer with shutdown, including senders
+	// paused after their parent check. Shutdown closes this gate before drain.
+	l.enqueueMu.RLock()
+	defer l.enqueueMu.RUnlock()
+	if l.schedulingStopped {
+		return
+	}
 	if !l.store.retain(b) {
 		return
 	}
 	b.mu.Lock()
-	if b.queued || b.terminalReason != "" {
+	if b.queued || b.busy || b.terminalReason != "" || l.parent.Err() != nil || l.control.Load().closed {
 		b.mu.Unlock()
 		l.store.release(b)
 		return
@@ -206,9 +224,9 @@ func (l *Limiter) notify(b *bucket) {
 	}
 }
 
-// prepareAttempt requires a retained bucket reference. For INIT, workers first
-// obtain TIME and generate an identity outside locks, then stage the immutable
-// command under b.mu after rechecking ownership. The core never does I/O.
+// prepareAttempt requires a retained bucket reference. Cold preparation claims
+// ownership with a zero operation; the worker samples TIME and stages the
+// immutable INIT under that ownership. The transition itself never does I/O.
 func (l *Limiter) prepareAttempt(b *bucket, now time.Time) (attempt, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -219,10 +237,10 @@ func (l *Limiter) prepareAttempt(b *bucket, now time.Time) (attempt, bool) {
 	var c command
 	var payload batch
 	if !b.initialized {
-		if b.init == nil {
-			return attempt{}, false
+		if b.init != nil {
+			c = *b.init
 		}
-		c = *b.init
+		// A zero operation claims the same ownership while sampling TIME.
 	} else {
 		c = command{Session: b.session, Slot: b.slot, RateU: l.cfg.globalRateU, BurstU: int64(l.cfg.globalBurst) * 1e6}
 		if p, ok := b.ledger.begin(); ok {
@@ -239,6 +257,7 @@ func (l *Limiter) prepareAttempt(b *bucket, now time.Time) (attempt, bool) {
 	a := attempt{command: c, batch: payload, id: b.attemptID, generation: s.generation, start: now}
 	b.active = a
 	b.busy = true
+	b.nextSyncAt = now.Add(l.cfg.syncInterval)
 	return a, true
 }
 
@@ -279,6 +298,8 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 			b.terminalReason = d.Reason
 		}
 		if d.Reinitialize {
+			// Reinitialization is permitted only with no unresolved receipts.
+			b.ledger = ledger{}
 			b.initialized = false
 			b.init = nil
 			b.freshUntil = time.Time{}
@@ -297,6 +318,7 @@ func (l *Limiter) installReply(b *bucket, a attempt, r reply) {
 		b.init = nil
 	}
 	b.capacityUntil = time.Time{}
+	b.checkedGeneration = s.generation
 	// ACK and rejection install are one atomic transition. No caller can observe
 	// freed capacity before a negative/fractional balance has blocked admission.
 	b.globalRejected = !d.Authorized

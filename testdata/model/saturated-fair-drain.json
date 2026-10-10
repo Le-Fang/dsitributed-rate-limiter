@@ -1,0 +1,119 @@
+{
+  "Seed": 7001,
+  "Config": {
+    "Instances": 1,
+    "RateU": 100000000,
+    "Burst": 100,
+    "Cap": 5,
+    "LocalRateU": 10000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "a"
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "a"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "a",
+      "Cost": 5
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "b"
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "b"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "b",
+      "Cost": 5
+    },
+    {
+      "Kind": "DrainNotifications",
+      "Key": "a"
+    },
+    {
+      "Kind": "SaturateQueue",
+      "Key": "a"
+    },
+    {
+      "Kind": "QueueSync",
+      "Key": "a"
+    },
+    {
+      "Kind": "QueueSync",
+      "Key": "b"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "a",
+      "Cost": 1
+    },
+    {
+      "Kind": "AdvanceTime",
+      "Key": "a",
+      "AdvanceNS": 2000000000
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "b",
+      "Cost": 1
+    },
+    {
+      "Kind": "DrainNotifications",
+      "Key": "a"
+    },
+    {
+      "Kind": "ScanUntilQueued",
+      "Key": "a"
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "a",
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "a",
+      "Attempt": 1
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "a",
+      "Attempt": 1
+    },
+    {
+      "Kind": "RequireNormal",
+      "Key": "a"
+    },
+    {
+      "Kind": "ScanUntilQueued",
+      "Key": "b"
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "b",
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "b",
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "b",
+      "Attempt": 2
+    },
+    {
+      "Kind": "RequireNormal",
+      "Key": "b"
+    }
+  ]
+}

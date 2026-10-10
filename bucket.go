@@ -157,7 +157,9 @@ type bucket struct {
 	session               string
 	slot                  int
 	freshUntil            time.Time
+	nextSyncAt            time.Time
 	authorizedGeneration  uint64
+	checkedGeneration     uint64 // last successful balance observation, including rejection
 	globalRejected        bool
 	retryAt               time.Time
 	terminalReason        string

@@ -24,11 +24,12 @@ type bucketStore struct {
 	fallbackBurst int
 	scanMu        sync.Mutex
 	scanShard     int
+	cleanupShard  int
 }
 type storeShard struct {
-	mu           sync.Mutex
-	keys         map[string]*bucket
-	head, cursor *bucket
+	mu                          sync.Mutex
+	keys                        map[string]*bucket
+	head, cursor, cleanupCursor *bucket
 }
 
 func newBucketStore(c coreConfig) *bucketStore {
@@ -74,7 +75,7 @@ func (s *bucketStore) acquire(key string, now time.Time) (*bucket, bool) {
 	b.tokens.fallbackRate, b.tokens.fallbackBurst = s.fallbackRate, s.fallbackBurst
 	if sh.head == nil {
 		b.next, b.prev = b, b
-		sh.head, sh.cursor = b, b
+		sh.head, sh.cursor, sh.cleanupCursor = b, b, b
 	} else {
 		b.next, b.prev = sh.head, sh.head.prev
 		sh.head.prev.next = b
@@ -129,10 +130,10 @@ func (s *bucketStore) cleanup(now time.Time, limit int) {
 	defer s.scanMu.Unlock()
 	visited, empty := 0, 0
 	for visited < limit && empty < shardCount {
-		sh := &s.shards[s.scanShard]
-		s.scanShard = (s.scanShard + 1) % shardCount
+		sh := &s.shards[s.cleanupShard]
+		s.cleanupShard = (s.cleanupShard + 1) % shardCount
 		sh.mu.Lock()
-		b := sh.cursor
+		b := sh.cleanupCursor
 		if b == nil {
 			empty++
 			sh.mu.Unlock()
@@ -140,7 +141,7 @@ func (s *bucketStore) cleanup(now time.Time, limit int) {
 		}
 		empty = 0
 		visited++
-		sh.cursor = b.next
+		sh.cleanupCursor = b.next
 		b.mu.Lock()
 		// Eligibility checks must not credit the live balance at a stale normal
 		// rate before admission has observed a circuit/policy transition.
@@ -148,7 +149,7 @@ func (s *bucketStore) cleanup(now time.Time, limit int) {
 		eligible := b.refs == 0 && !b.busy && !b.queued && b.ledger.outstanding() == 0 && !b.globalRejected && b.terminalReason == "" && b.capacityUntil.IsZero() && now.Sub(b.lastActivity) >= s.idleTTL && tokens.safeToEvict(now)
 		if eligible {
 			if b.next == b {
-				sh.head, sh.cursor = nil, nil
+				sh.head, sh.cursor, sh.cleanupCursor = nil, nil, nil
 			} else {
 				b.prev.next = b.next
 				b.next.prev = b.prev

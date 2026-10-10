@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -61,16 +62,37 @@ type fakeCall struct {
 	result  chan fakeResult
 }
 type fakeBackend struct {
-	mu     sync.Mutex
-	calls  []*fakeCall
-	clock  *fakeClock
-	closed bool
+	mu         sync.Mutex
+	calls      []*fakeCall
+	clock      *fakeClock
+	closed     bool
+	active     atomic.Int64
+	peak       atomic.Int64
+	timeCalls  atomic.Int64
+	probeCalls atomic.Int64
+	timeFn     func(context.Context) (time.Time, error)
+	probeFn    func(context.Context) error
 }
 
-func (b *fakeBackend) Time(context.Context) (time.Time, error) { return b.clock.Now(), nil }
-func (b *fakeBackend) Probe(context.Context) error             { return nil }
-func (b *fakeBackend) Close() error                            { b.mu.Lock(); defer b.mu.Unlock(); b.closed = true; return nil }
+func (b *fakeBackend) Time(ctx context.Context, key string) (time.Time, error) {
+	defer b.enter()()
+	b.timeCalls.Add(1)
+	if b.timeFn != nil {
+		return b.timeFn(ctx)
+	}
+	return b.clock.Now(), nil
+}
+func (b *fakeBackend) Probe(ctx context.Context) error {
+	defer b.enter()()
+	b.probeCalls.Add(1)
+	if b.probeFn != nil {
+		return b.probeFn(ctx)
+	}
+	return nil
+}
+func (b *fakeBackend) Close() error { b.mu.Lock(); defer b.mu.Unlock(); b.closed = true; return nil }
 func (b *fakeBackend) Execute(ctx context.Context, key string, c command) (reply, error) {
+	defer b.enter()()
 	call := &fakeCall{key: key, command: c, result: make(chan fakeResult, 1)}
 	b.mu.Lock()
 	b.calls = append(b.calls, call)
@@ -79,7 +101,7 @@ func (b *fakeBackend) Execute(ctx context.Context, key string, c command) (reply
 	case r := <-call.result:
 		return r.reply, r.err
 	case <-ctx.Done():
-		return reply{}, ctx.Err()
+		return reply{}, &backendError{class: errorTransient, cause: ctx.Err()}
 	}
 }
 func (b *fakeBackend) queued() []*fakeCall {
@@ -124,3 +146,14 @@ func initializeTestBucket(t *testing.T, l *Limiter, b *bucket, balance int64) at
 	l.installReply(b, a, reply{Outcome: outcomeOK, Slot: 0, BalanceU: balance, SessionTTLMS: 86400000, FreshInit: true})
 	return a
 }
+
+func (b *fakeBackend) enter() func() {
+	n := b.active.Add(1)
+	for old := b.peak.Load(); n > old; old = b.peak.Load() {
+		if b.peak.CompareAndSwap(old, n) {
+			break
+		}
+	}
+	return func() { b.active.Add(-1) }
+}
+func (b *fakeBackend) MaxConcurrent() int { return int(b.peak.Load()) }

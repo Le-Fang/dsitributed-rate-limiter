@@ -66,6 +66,7 @@ type coreConfig struct {
 	globalRateU, localRateU, fallbackRateU int64
 	globalBurst, localBurst, fallbackBurst int
 	syncInterval                           time.Duration
+	operationTimeout                       time.Duration
 	syncThreshold, maxOutstanding          int
 	maxSyncAge                             time.Duration
 	maxKeys                                int
@@ -79,7 +80,7 @@ func (c normalizedConfig) core() coreConfig {
 		localRateU:    int64(math.Round(c.LocalRate * 1e6)),
 		fallbackRateU: int64(math.Round(c.FallbackRate * 1e6)),
 		globalBurst:   c.GlobalBurst, localBurst: c.LocalBurst, fallbackBurst: c.FallbackBurst,
-		syncInterval: c.SyncInterval, syncThreshold: c.SyncThreshold,
+		syncInterval: c.SyncInterval, syncThreshold: c.SyncThreshold, operationTimeout: c.Redis.Timeout,
 		maxOutstanding: c.MaxOutstanding, maxSyncAge: c.MaxSyncAge,
 		maxKeys: c.MaxKeys, idleTTL: c.IdleTTL, failurePolicy: c.FailurePolicy,
 	}

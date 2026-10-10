@@ -75,8 +75,8 @@ local logical = math.max(now, last)
 if logical > MAX - RETENTION then return failure('NUMERIC_LIMIT') end
 local chosen, fresh = nil, '0'
 if op == 'INIT' then
-    if logical >= deadline then return failure('INIT_EXPIRED') end
-    if deadline - logical > 30000 then return failure('INVALID_ARGUMENT') end
+    -- Clock/topology changes invalidate a clean registration window safely.
+    if logical >= deadline or deadline - logical > 30000 then return failure('INIT_EXPIRED') end
     local free, matched = nil, nil
     for i = 0, 255 do
         local raw = redis.call('HGET', KEYS[1], 's:' .. integer(i))

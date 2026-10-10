@@ -150,7 +150,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 	for i := range clocks {
 		clocks[i] = newFakeClock(start)
 		generations[i] = 1
-		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 100, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
+		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 2048, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
 		limiters[i] = newLimiterCore(c, context.Background(), clocks[i], &fakeBackend{clock: clocks[i]}, nil)
 	}
 	subjects := map[modelBucketID]*foundationSubject{}
@@ -205,6 +205,39 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			oracle.rejected = r.BalanceU < 1e6
 			oracle.freshNS = nowNS + cfg.FreshnessNS
 			oracle.generation = generations[id.instance]
+		case "DrainNotifications":
+			drainModelNotifications(subject.limiter, nil)
+		case "SaturateQueue":
+			l := subject.limiter
+			for i := 0; i < 1024; i++ {
+				b, ok := l.store.acquire(fmt.Sprintf("queue-filler-%d", i), clocks[id.instance].Now())
+				if !ok {
+					return fail(index, "filler capacity")
+				}
+				l.notify(b)
+				l.store.release(b)
+			}
+			if len(l.work) != 1024 {
+				return fail(index, "queue not saturated")
+			}
+		case "QueueSync":
+			subject.limiter.notify(subject.bucket)
+			if subject.bucket.queued {
+				return fail(index, "saturated notification was not dropped")
+			}
+		case "ScanUntilQueued":
+			found := false
+			for pass := 0; pass < 128 && !found; pass++ {
+				subject.limiter.scanDue(clocks[id.instance].Now())
+				drainModelNotifications(subject.limiter, func(b *bucket) {
+					if b == subject.bucket {
+						found = true
+					}
+				})
+			}
+			if !found {
+				return fail(index, "scan failed to rediscover dropped work")
+			}
 		case "AdvanceTime":
 			if event.AdvanceNS < 0 {
 				return fail(index, "negative time advance")
@@ -732,5 +765,26 @@ func TestStateMachineFoundationDetectsBackendUndercharge(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "backend accounting: applied=1 receipts=3") {
 		t.Fatalf("undercharged backend was not detected by conservation: %v", err)
+	}
+}
+
+// Deterministic scheduling traces consume retained hints without starting
+// goroutines; preparation/execution/delivery remain separate oracle events.
+func drainModelNotifications(l *Limiter, visit func(*bucket)) {
+	for {
+		select {
+		case b := <-l.work:
+			if b != nil {
+				b.mu.Lock()
+				b.queued = false
+				b.mu.Unlock()
+				if visit != nil {
+					visit(b)
+				}
+				l.store.release(b)
+			}
+		default:
+			return
+		}
 	}
 }

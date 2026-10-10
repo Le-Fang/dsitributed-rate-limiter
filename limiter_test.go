@@ -187,8 +187,9 @@ func TestLimiterNewConstructorCold(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.backend.Close()
+	defer func() { l.cancelWorkers(); <-l.workersDone }()
 	if ok, r, _ := l.Allow("k"); ok || r != ReasonSyncPending {
-		t.Fatal("constructor must remain cold before scheduler")
+		t.Fatal("first admission must initialize asynchronously")
 	}
 }
 
