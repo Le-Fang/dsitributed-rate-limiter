@@ -1,0 +1,1 @@
+{"Seed":8002,"Config":{"Instances":1,"RateU":100000000,"Burst":100,"Cap":5,"LocalBurst":5},"Events":[{"Kind":"CreateKey","Key":"k"},{"Kind":"Initialize","Key":"k"},{"Kind":"AllowN","Key":"k","Cost":3},{"Kind":"CloseBudgetExpired","Key":"k"},{"Kind":"Close","Key":"k"},{"Kind":"AllowN","Key":"k","Cost":1}]}

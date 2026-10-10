@@ -33,26 +33,18 @@ func (l *Limiter) start() {
 			for {
 				select {
 				case <-ctx.Done():
+					if l.parent.Err() != nil {
+						l.beginShutdown()
+					}
 					// Publish stop and wait only for bounded enqueue sections.
 					// Release the gate before joining workers or draining refs.
 					l.enqueueMu.Lock()
 					l.schedulingStopped = true
 					l.enqueueMu.Unlock()
 					workers.Wait()
-					for {
-						select {
-						case b := <-l.work:
-							if b != nil {
-								b.mu.Lock()
-								b.queued = false
-								b.mu.Unlock()
-								l.store.release(b)
-							}
-						default:
-							close(l.workersDone)
-							return
-						}
-					}
+					l.drainWork()
+					close(l.workersDone)
+					return
 				case <-timer.C():
 					l.scanDue(l.clock.Now())
 					timer.Reset(tick)
@@ -245,4 +237,21 @@ func (l *Limiter) runProbe(ctx context.Context) {
 		l.nextProbeAt = l.clock.Now().Add(l.jitter(l.probeBackoff))
 	}
 	l.circuitMu.Unlock()
+}
+
+// drainWork runs only after the enqueue gate closes and workers join.
+func (l *Limiter) drainWork() {
+	for {
+		select {
+		case b := <-l.work:
+			if b != nil {
+				b.mu.Lock()
+				b.queued = false
+				b.mu.Unlock()
+				l.store.release(b)
+			}
+		default:
+			return
+		}
+	}
 }

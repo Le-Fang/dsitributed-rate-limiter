@@ -35,14 +35,20 @@ type Limiter struct {
 	startOnce         sync.Once
 	cancelWorkers     context.CancelFunc
 	workersDone       chan struct{}
-	jitter            func(time.Duration) time.Duration // fixed before start; circuitMu serializes use
-	probeQueued       bool                              // following recovery fields protected by circuitMu
+	shutdownOnce      sync.Once
+	shutdownDone      chan struct{}
+	shutdownErr       error                                        // published by closing shutdownDone
+	shutdownContext   func() (context.Context, context.CancelFunc) // fixed before start
+	jitter            func(time.Duration) time.Duration            // fixed before start; circuitMu serializes use
+	probeQueued       bool                                         // following recovery fields protected by circuitMu
 	nextProbeAt       time.Time
 	probeBackoff      time.Duration
 }
 
 func newLimiterCore(c coreConfig, parent context.Context, clock clock, b backend, m Metrics) *Limiter {
-	l := &Limiter{cfg: c, parent: parent, clock: clock, backend: b, metrics: m, store: newBucketStore(c), work: make(chan *bucket, 1024), workersDone: make(chan struct{}), jitter: fullJitter}
+	l := &Limiter{cfg: c, parent: parent, clock: clock, backend: b, metrics: m, store: newBucketStore(c), work: make(chan *bucket, 1024), workersDone: make(chan struct{}), shutdownDone: make(chan struct{}), shutdownContext: func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), shutdownBudget)
+	}, jitter: fullJitter}
 	l.control.Store(&controlState{generation: 1})
 	return l
 }

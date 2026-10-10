@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -146,12 +147,19 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 	generations := make([]uint64, cfg.Instances)
 	openCircuits := make([]bool, cfg.Instances)
 	limiters := make([]*Limiter, cfg.Instances)
+	cancels := make([]context.CancelFunc, cfg.Instances)
+	closed := make([]bool, cfg.Instances)
+	completed := make([]bool, cfg.Instances)
+	results := make([]error, cfg.Instances)
 	start := time.Unix(1700000000, 0)
 	for i := range clocks {
 		clocks[i] = newFakeClock(start)
 		generations[i] = 1
-		c := coreConfig{globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 2048, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
-		limiters[i] = newLimiterCore(c, context.Background(), clocks[i], &fakeBackend{clock: clocks[i]}, nil)
+		c := coreConfig{operationTimeout: time.Second, globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 2048, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
+		parent, cancel := context.WithCancel(context.Background())
+		cancels[i] = cancel
+		defer cancel()
+		limiters[i] = newLimiterCore(c, parent, clocks[i], &fakeBackend{clock: clocks[i]}, nil)
 	}
 	subjects := map[modelBucketID]*foundationSubject{}
 	oracles := map[modelBucketID]*foundationOracle{}
@@ -246,6 +254,93 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			for _, c := range clocks {
 				c.Advance(time.Duration(event.AdvanceNS))
 			}
+		case "CancelParent":
+			cancels[id.instance]()
+			closed[id.instance] = true
+		case "Close", "CloseBudgetExpired":
+			l := subject.limiter
+			closed[id.instance] = true
+			if completed[id.instance] {
+				if got := l.Close(context.Background()); got != results[id.instance] {
+					return fail(index, "changed shared shutdown result")
+				}
+				break
+			}
+			var modelErr error
+			budgetCtx, expire := context.WithCancel(context.Background())
+			defer expire()
+			if event.Kind == "CloseBudgetExpired" {
+				l.shutdownContext = func() (context.Context, context.CancelFunc) {
+					return lifecycleDeadline{budgetCtx, time.Now().Add(5 * time.Second)}, expire
+				}
+			}
+			transport := &lifecycleBackend{backend: l.backend}
+			transport.execute = func(ctx context.Context, key string, c command) (reply, error) {
+				owner := modelBucketID{id.instance, key}
+				o := oracles[owner]
+				if o == nil || o.busy != 0 {
+					modelErr = fmt.Errorf("flush without joined ownership")
+					return reply{}, modelErr
+				}
+				if o.flight == 0 {
+					o.latestBatch++
+					o.flight = o.latestBatch
+					for i := range o.receipts {
+						if o.receipts[i].sequence == 0 {
+							o.receipts[i].sequence = o.flight
+						}
+					}
+				}
+				var delta int64
+				for _, r := range o.receipts {
+					if r.sequence == o.flight {
+						delta += r.cost
+					}
+				}
+				want := command{Op: opApply, Session: fmt.Sprintf("%032x", id.instance+1), Slot: o.slot, Sequence: o.flight, Delta: delta, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
+				if c != want {
+					modelErr = fmt.Errorf("flush identity %+v expected %+v", c, want)
+					return reply{}, modelErr
+				}
+				r := execute(remotes[key], c, start.UnixMilli()+nowNS/int64(time.Millisecond))
+				if r.Outcome != outcomeOK && r.Outcome != outcomeDuplicate {
+					modelErr = fmt.Errorf("flush backend rejected %+v", r)
+					return reply{}, modelErr
+				}
+				for i := range o.receipts {
+					if o.receipts[i].sequence == o.flight {
+						o.receipts[i].applied = true
+					}
+				}
+				if event.Kind == "CloseBudgetExpired" {
+					expire()
+					return reply{}, &backendError{class: errorTransient, cause: context.DeadlineExceeded}
+				}
+				for i := range o.receipts {
+					if o.receipts[i].sequence == o.flight {
+						o.receipts[i].acknowledged = true
+					}
+				}
+				o.acknowledged, o.flight = o.flight, 0
+				return r, nil
+			}
+			l.backend = transport
+			result := l.Close(context.Background())
+			if modelErr != nil {
+				return fail(index, "%v", modelErr)
+			}
+			if event.Kind == "CloseBudgetExpired" {
+				if !errors.Is(result, context.DeadlineExceeded) {
+					return fail(index, "missing shutdown deadline: %v", result)
+				}
+			} else if result != nil {
+				return fail(index, "shutdown: %v", result)
+			}
+			if transport.closeCount.Load() != 1 {
+				return fail(index, "cleanup not shared")
+			}
+			completed[id.instance] = true
+			results[id.instance] = result
 		case "OpenCircuit":
 			subject.limiter.recordFailure(transientFailure())
 			if !openCircuits[id.instance] {
@@ -279,7 +374,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			unavailable := openCircuits[id.instance] || (oracle.initialized && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS)) || (!oracle.initialized && nowNS-oracle.createdNS >= cfg.FreshnessNS)
 			// Independent rational refill, delayed until the same observable
 			// transition. No production token, ledger or admission helpers.
-			if !invalid {
+			if !invalid && !closed[id.instance] {
 				if cfg.Policy == LocalOnly && unavailable && !oracle.fallback {
 					oracle.refill(nowNS, cfg.FallbackRateU, cfg.LocalBurst)
 					oracle.clamp(cfg.FallbackBurst)
@@ -292,6 +387,8 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			}
 			wantReason, wantMode := ReasonAllowed, ModeNormal
 			switch {
+			case closed[id.instance]:
+				wantReason, wantMode = ReasonClosed, ModeBlocked
 			case invalid:
 				wantReason, wantMode = ReasonInvalidRequest, ModeBlocked
 			case oracle.rejected:
