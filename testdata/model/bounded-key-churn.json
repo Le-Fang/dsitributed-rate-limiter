@@ -1,0 +1,45 @@
+{
+  "Seed": 10002,
+  "Config": {
+    "Instances": 1,
+    "Cap": 2,
+    "MaxKeys": 2,
+    "IdleNS": 1000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "a"
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "b"
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "c"
+    },
+    {
+      "Kind": "AdvanceTime",
+      "Key": "a",
+      "AdvanceNS": 1000000
+    },
+    {
+      "Kind": "EvictCleanKey",
+      "Key": "a"
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "c"
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "c"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "c",
+      "Cost": 1
+    }
+  ]
+}

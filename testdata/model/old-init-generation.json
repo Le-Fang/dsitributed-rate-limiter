@@ -1,0 +1,73 @@
+{
+  "Seed": 10000,
+  "Config": {
+    "Instances": 2,
+    "Cap": 3,
+    "Burst": 3,
+    "LocalBurst": 3,
+    "RateU": 1000000,
+    "LocalRateU": 1000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "k",
+      "Attempt": 0
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "OpenCircuit",
+      "Key": "k",
+      "Attempt": 0
+    },
+    {
+      "Kind": "ProbeSuccess",
+      "Key": "k",
+      "Attempt": 0
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Attempt": 0,
+      "Cost": 1
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "RequireNormal",
+      "Key": "k"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 1
+    }
+  ]
+}

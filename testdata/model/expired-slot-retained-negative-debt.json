@@ -1,0 +1,93 @@
+{
+  "Seed": 10004,
+  "Config": {
+    "Instances": 2,
+    "Cap": 3,
+    "Burst": 1,
+    "RateU": 1,
+    "LocalRateU": 1000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "k"
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "k"
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 3
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "LoseReply",
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExpireSession",
+      "Key": "k"
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "k",
+      "Instance": 1
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Instance": 1,
+      "Cost": 1
+    },
+    {
+      "Kind": "RetrySameBatch",
+      "Key": "k",
+      "Attempt": 3
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Attempt": 3
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Attempt": 3
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Cost": 1
+    }
+  ]
+}

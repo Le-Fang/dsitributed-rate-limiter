@@ -1,0 +1,65 @@
+{
+  "Seed": 0,
+  "Config": {
+    "Instances": 2,
+    "RateU": 1000000,
+    "Burst": 3,
+    "Cap": 2,
+    "LocalBurst": 2,
+    "FallbackBurst": 1,
+    "LocalRateU": 2000000,
+    "FallbackRateU": 500000,
+    "SyncNS": 0,
+    "FreshnessNS": 0,
+    "IdleNS": 0,
+    "MaxKeys": 0,
+    "Policy": 0
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "Initialize",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "AllowN",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 1,
+      "AdvanceNS": 0,
+      "Attempt": 873,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "ExpireSession",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 974,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "Close",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 974,
+      "Checkpoint": ""
+    }
+  ]
+}

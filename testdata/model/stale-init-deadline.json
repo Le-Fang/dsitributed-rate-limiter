@@ -1,0 +1,66 @@
+{
+  "Seed": 10000,
+  "Config": {
+    "Instances": 2,
+    "Cap": 3,
+    "Burst": 3,
+    "LocalBurst": 3,
+    "RateU": 1000000,
+    "LocalRateU": 1000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Instance": 0,
+      "Key": "k"
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "AdvanceRedisTime",
+      "Instance": 0,
+      "Key": "k",
+      "AdvanceNS": 30000000000
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "DeliverReply",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 1
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Instance": 0,
+      "Key": "k",
+      "Attempt": 2
+    },
+    {
+      "Kind": "AllowN",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 1
+    }
+  ]
+}

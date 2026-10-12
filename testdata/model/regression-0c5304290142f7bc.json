@@ -1,0 +1,70 @@
+{
+  "Seed": 10001,
+  "Config": {
+    "Instances": 2,
+    "RateU": 1000000,
+    "Burst": 3,
+    "Cap": 3,
+    "LocalBurst": 3,
+    "FallbackBurst": 0,
+    "LocalRateU": 1000000,
+    "FallbackRateU": 0,
+    "SyncNS": 0,
+    "FreshnessNS": 0,
+    "IdleNS": 0,
+    "MaxKeys": 0,
+    "Policy": 0
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 0,
+      "DeltaOverride": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "Initialize",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 0,
+      "DeltaOverride": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "AllowN",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 1,
+      "AdvanceNS": 0,
+      "Attempt": 0,
+      "DeltaOverride": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 3,
+      "DeltaOverride": 0,
+      "Checkpoint": ""
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Instance": 0,
+      "Key": "k",
+      "Cost": 0,
+      "AdvanceNS": 0,
+      "Attempt": 3,
+      "DeltaOverride": 2,
+      "Checkpoint": ""
+    }
+  ]
+}

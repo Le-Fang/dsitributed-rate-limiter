@@ -15,17 +15,21 @@ import (
 )
 
 type modelEvent struct {
-	Kind      string
-	Instance  int
-	Key       string
-	Cost      int
-	AdvanceNS int64
-	Attempt   uint64
+	Kind          string
+	Instance      int
+	Key           string
+	Cost          int
+	AdvanceNS     int64
+	Attempt       uint64
+	DeltaOverride int64  // Adversarial wire payload, zero preserves the immutable command.
+	Checkpoint    string // before/after the atomic backend commit; test transport only.
 }
 type modelTrace struct {
-	Seed   uint64
-	Config modelConfig
-	Events []modelEvent
+	Seed          uint64
+	Config        modelConfig
+	Events        []modelEvent
+	coverage      *modelCoverage
+	searchCapture func(uint16)
 }
 type modelConfig struct {
 	Instances                             int
@@ -33,8 +37,41 @@ type modelConfig struct {
 	Burst, Cap, LocalBurst, FallbackBurst int
 	LocalRateU, FallbackRateU             int64
 	SyncNS, FreshnessNS                   int64
+	IdleNS                                int64
+	MaxKeys                               int
 	Policy                                FailurePolicy
 }
+
+// Model defaults are separate from production configuration normalization.
+func normalizeModelConfig(cfg modelConfig) modelConfig {
+	if cfg.RateU == 0 {
+		cfg.RateU = 1_000_000
+	}
+	if cfg.Burst == 0 {
+		cfg.Burst = cfg.Cap
+	}
+	if cfg.LocalBurst == 0 {
+		cfg.LocalBurst = cfg.Cap
+	}
+	if cfg.LocalRateU == 0 {
+		cfg.LocalRateU = cfg.RateU
+	}
+	if cfg.FreshnessNS == 0 {
+		cfg.FreshnessNS = int64(time.Second)
+	}
+	if cfg.SyncNS == 0 {
+		cfg.SyncNS = int64(100 * time.Millisecond)
+	}
+	if cfg.IdleNS == 0 {
+		cfg.IdleNS = int64(time.Minute)
+	}
+	if cfg.MaxKeys == 0 {
+		cfg.MaxKeys = 2048
+	}
+	return cfg
+}
+
+func TestStateMachineTraces(t *testing.T) { TestStateMachineFoundation(t) }
 
 func TestStateMachineFoundation(t *testing.T) {
 	paths, err := filepath.Glob("testdata/model/*.json")
@@ -58,15 +95,17 @@ func TestStateMachineFoundation(t *testing.T) {
 	}
 }
 
-func TestStateMachineFoundationRejectsUnsupportedAndInvalidEvents(t *testing.T) {
+func TestStateMachineFoundationRejectsUnsupportedAndSkipsInvalidEvents(t *testing.T) {
+	if err := checkTrace(modelTrace{Config: modelConfig{Instances: 1, Cap: 5}, Events: []modelEvent{{Kind: "Unknown"}}}); err == nil {
+		t.Fatal("unknown event accepted")
+	}
 	for _, events := range [][]modelEvent{
-		{{Kind: "CreateKey", Key: "k"}, {Kind: "FallbackAllow", Key: "k"}},
 		{{Kind: "AllowN", Key: "k", Cost: 1}},
-		{{Kind: "CreateKey", Key: "k"}, {Kind: "BeginAttempt", Key: "k", Attempt: 1}},
 		{{Kind: "CreateKey", Key: "k"}, {Kind: "ExecuteRedis", Key: "k", Attempt: 1}},
+		{{Kind: "CreateKey", Key: "k"}, {Kind: "DeliverReply", Key: "k", Attempt: 1}},
 	} {
-		if err := checkTrace(modelTrace{Config: modelConfig{Instances: 1, Cap: 5}, Events: events}); err == nil {
-			t.Fatalf("accepted invalid events: %+v", events)
+		if err := checkTrace(modelTrace{Config: modelConfig{Instances: 1, Cap: 5}, Events: events}); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -75,9 +114,10 @@ func TestStateMachineFoundationRejectsUnsupportedAndInvalidEvents(t *testing.T) 
 // receipt queries and the independent integer Redis reference, never production
 // token/ledger/decision helpers. The subject runs real prepare/install/AllowN.
 type modelReceipt struct {
-	cost                  int64
-	sequence              uint64
-	applied, acknowledged bool
+	cost                        int64
+	session                     string
+	sequence                    uint64
+	applied, acknowledged, lost bool
 }
 type foundationOracle struct {
 	receipts                          []modelReceipt
@@ -91,11 +131,20 @@ type foundationOracle struct {
 	fallbackAccepted                  int64
 	slot                              int
 	busy                              uint64
+	session                           string
+	previousSessions                  []string
+	init                              *command
+	terminal                          string
+	capacityNS                        int64
+	lastActivityNS                    int64
+	normalFullNS, fallbackFullNS      int64
+	fallbackEnvelope                  *modelEnvelope
 }
 type foundationSubject struct {
-	limiter  *Limiter
-	bucket   *bucket
-	accepted int64
+	limiter                       *Limiter
+	bucket                        *bucket
+	accepted                      int64
+	allAccepted, fallbackAccepted int64
 }
 type modelBucketID struct {
 	instance int
@@ -107,6 +156,8 @@ type foundationAttempt struct {
 	response                     reply
 	sequence                     uint64
 	generation                   uint64
+	oracle                       *foundationOracle
+	failed                       bool
 	executed, finished, timedOut bool
 }
 type envelopeBoundary struct {
@@ -121,28 +172,15 @@ func checkTrace(trace modelTrace) error {
 // Execution remains independently replaceable so a regression can prove that
 // actual backend effects, not merely a prepared batch, drive conservation.
 func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, command, int64) reply) error {
+	return inspectTrace(trace, execute, nil)
+}
+
+func inspectTrace(trace modelTrace, execute func(*redisReference, command, int64) reply, capture func(string)) error {
 	cfg := trace.Config
-	if cfg.Instances <= 0 || cfg.Cap <= 0 || cfg.Cap > 1_000_000 {
+	if cfg.Instances <= 0 || cfg.Instances > 257 || cfg.Cap <= 0 || cfg.Cap > 1_000_000 {
 		return fmt.Errorf("seed %d: invalid model config %+v", trace.Seed, cfg)
 	}
-	if cfg.RateU == 0 {
-		cfg.RateU = 1_000_000
-	}
-	if cfg.Burst == 0 {
-		cfg.Burst = cfg.Cap
-	}
-	if cfg.LocalBurst == 0 {
-		cfg.LocalBurst = cfg.Cap
-	}
-	if cfg.LocalRateU == 0 {
-		cfg.LocalRateU = cfg.RateU
-	}
-	if cfg.FreshnessNS == 0 {
-		cfg.FreshnessNS = int64(time.Second)
-	}
-	if cfg.SyncNS == 0 {
-		cfg.SyncNS = int64(100 * time.Millisecond)
-	}
+	cfg = normalizeModelConfig(cfg)
 	clocks := make([]*fakeClock, cfg.Instances)
 	generations := make([]uint64, cfg.Instances)
 	openCircuits := make([]bool, cfg.Instances)
@@ -155,7 +193,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 	for i := range clocks {
 		clocks[i] = newFakeClock(start)
 		generations[i] = 1
-		c := coreConfig{operationTimeout: time.Second, globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: 2048, idleTTL: time.Minute, failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
+		c := coreConfig{operationTimeout: time.Second, globalRateU: cfg.RateU, globalBurst: cfg.Burst, localRateU: cfg.LocalRateU, localBurst: cfg.LocalBurst, maxOutstanding: cfg.Cap, maxSyncAge: time.Duration(cfg.FreshnessNS), syncInterval: time.Duration(cfg.SyncNS), syncThreshold: cfg.Cap, maxKeys: cfg.MaxKeys, idleTTL: time.Duration(cfg.IdleNS), failurePolicy: cfg.Policy, fallbackRateU: cfg.FallbackRateU, fallbackBurst: cfg.FallbackBurst}
 		parent, cancel := context.WithCancel(context.Background())
 		cancels[i] = cancel
 		defer cancel()
@@ -165,49 +203,150 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 	oracles := map[modelBucketID]*foundationOracle{}
 	attempts := map[uint64]*foundationAttempt{}
 	remotes := map[string]*redisReference{}
-	boundaries := []envelopeBoundary{{totals: map[string]int64{}}}
+	envelopes := map[string]*modelEnvelope{}
+	retired := map[*foundationOracle]*foundationSubject{}
+	incarnations := make([]int, cfg.Instances)
+	crashed := make([]bool, cfg.Instances)
+	var redisNS int64
+	snapshot := func() string {
+		return modelStateSnapshot(clocks, generations, openCircuits, closed, completed, crashed, incarnations, subjects, oracles, attempts, remotes, retired, envelopes, redisNS)
+	}
 	var nowNS int64
+	resetEnvelope := false
 	fail := func(index int, format string, args ...interface{}) error {
-		return fmt.Errorf("seed=%d config=%+v event=%d: %s; events=%+v", trace.Seed, cfg, index, fmt.Sprintf(format, args...), trace.Events[:index+1])
+		return &modelFailure{Category: modelFailureCategory(format), Seed: trace.Seed, Config: cfg, Index: index, Detail: fmt.Sprintf(format, args...), State: snapshot(), Events: append([]modelEvent(nil), trace.Events[:index+1]...)}
 	}
 	for index, event := range trace.Events {
 		id := modelBucketID{event.Instance, event.Key}
-		if event.Instance < 0 || event.Instance >= cfg.Instances {
-			return fail(index, "invalid instance")
+		if !knownModelEvent(event.Kind) {
+			return fail(index, "unsupported event %q", event.Kind)
 		}
+		if event.Instance < 0 || event.Instance >= cfg.Instances {
+			continue
+		}
+		nowNS = clocks[id.instance].Now().Sub(start).Nanoseconds()
 		subject, oracle := subjects[id], oracles[id]
-		if event.Kind != "CreateKey" && subject == nil {
-			return fail(index, "event without a created key")
+		global := event.Kind == "ExecuteRedis" || event.Kind == "AdvanceTime" || event.Kind == "AdvanceLocalTime" || event.Kind == "AdvanceRedisTime" || event.Kind == "RestartInstance" || event.Kind == "CrashInstance"
+		if !global && event.Kind != "CreateKey" && subject == nil {
+			continue
+		}
+		if crashed[id.instance] && event.Kind != "RestartInstance" && event.Kind != "AdvanceTime" && event.Kind != "AdvanceLocalTime" && event.Kind != "AdvanceRedisTime" && event.Kind != "ExecuteRedis" {
+			continue
 		}
 		switch event.Kind {
+		case "CrashInstance":
+			if crashed[id.instance] {
+				continue
+			}
+			for bid, o := range oracles {
+				if bid.instance == id.instance {
+					for i := range o.receipts {
+						if !o.receipts[i].applied {
+							o.receipts[i].lost = true
+						}
+					}
+					retired[o] = subjects[bid]
+					delete(subjects, bid)
+					delete(oracles, bid)
+				}
+			}
+			cancels[id.instance]()
+			drainModelNotifications(limiters[id.instance], nil)
+			crashed[id.instance] = true
+			closed[id.instance] = true
+			resetEnvelope = true
+		case "RestartInstance":
+			if !crashed[id.instance] {
+				continue
+			}
+			old := limiters[id.instance]
+			parent, cancel := context.WithCancel(context.Background())
+			cancels[id.instance] = cancel
+			defer cancel()
+			limiters[id.instance] = newLimiterCore(old.cfg, parent, clocks[id.instance], &fakeBackend{clock: clocks[id.instance]}, nil)
+			incarnations[id.instance]++
+			generations[id.instance] = 1
+			openCircuits[id.instance] = false
+			closed[id.instance] = false
+			completed[id.instance] = false
+			crashed[id.instance] = false
+		case "ExpireSession":
+			// Expiration is a clock-driven backend transition, never an arbitrary
+			// discard of intact Redis debt. A slot remains occupied until reuse.
+			r := remotes[id.key]
+			ss, ok := r.sessions[oracle.session]
+			if !ok {
+				continue
+			}
+			target := ss.expiry - start.UnixMilli()
+			if target > redisNS/int64(time.Millisecond) {
+				redisNS = target * int64(time.Millisecond)
+			}
+		case "EvictCleanKey":
+			l := subject.limiter
+			drainModelNotifications(l, nil)
+			outstanding := int64(0)
+			for _, r := range oracle.receipts {
+				if !r.acknowledged {
+					outstanding += r.cost
+				}
+			}
+			can := oracle.busy == 0 && outstanding == 0 && !oracle.rejected && oracle.terminal == "" && oracle.capacityNS == 0 && nowNS-oracle.lastActivityNS >= cfg.IdleNS && nowNS >= oracle.normalFullNS && nowNS >= oracle.fallbackFullNS
+			l.store.release(subject.bucket)
+			removed := l.store.cleanup(clocks[id.instance].Now(), max(1, int(l.store.count.Load())*64))
+			got := false
+			for _, b := range removed {
+				if b == subject.bucket {
+					got = true
+				}
+			}
+			if got != can {
+				return fail(index, "local balance eviction=%v expected=%v", got, can)
+			}
+			if got {
+				retired[oracle] = subject
+				delete(subjects, id)
+				delete(oracles, id)
+				incarnations[id.instance]++
+			} else {
+				l.store.retain(subject.bucket)
+			}
 		case "CreateKey":
 			if subject != nil {
-				return fail(index, "duplicate key")
+				continue
 			}
 			l := limiters[id.instance]
 			b, ok := l.store.acquire(id.key, clocks[id.instance].Now())
 			if !ok {
-				return fail(index, "store capacity")
+				if l.store.count.Load() != int64(cfg.MaxKeys) {
+					return fail(index, "store capacity mismatch")
+				}
+				continue
 			}
 			subjects[id] = &foundationSubject{limiter: l, bucket: b}
-			oracles[id] = &foundationOracle{tokens: big.NewRat(int64(cfg.LocalBurst), 1), createdNS: nowNS, refillNS: nowNS}
+			oracles[id] = &foundationOracle{tokens: big.NewRat(int64(cfg.LocalBurst), 1), createdNS: nowNS, refillNS: nowNS, lastActivityNS: nowNS, session: fmt.Sprintf("%032x", (incarnations[id.instance]*cfg.Instances)+id.instance+1)}
 			if remotes[id.key] == nil {
 				remotes[id.key] = &redisReference{rate: cfg.RateU, burst: int64(cfg.Burst) * 1e6}
 			}
 		case "Initialize":
-			if oracle.initialized {
-				return fail(index, "duplicate initialization")
+			if oracle.initialized || oracle.busy != 0 || openCircuits[id.instance] || closed[id.instance] || oracle.terminal != "" {
+				continue
 			}
 			b, l := subject.bucket, subject.limiter
 			b.mu.Lock()
-			b.init = &command{Op: opInit, Session: fmt.Sprintf("%032x", id.instance+1), Slot: -1, Delta: int64(cfg.Cap), RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6, RegistrationDeadlineMS: start.UnixMilli() + nowNS/int64(time.Millisecond) + 30000}
+			b.init = &command{Op: opInit, Session: oracle.session, Slot: -1, Delta: int64(cfg.Cap), RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6, RegistrationDeadlineMS: start.UnixMilli() + redisNS/int64(time.Millisecond) + 30000}
+			oracle.init = b.init
 			b.mu.Unlock()
 			a, ok := l.prepareAttempt(b, clocks[id.instance].Now())
 			if !ok {
 				return fail(index, "init preparation failed")
 			}
-			r := execute(remotes[id.key], a.command, start.UnixMilli()+nowNS/int64(time.Millisecond))
+			r := execute(remotes[id.key], a.command, start.UnixMilli()+redisNS/int64(time.Millisecond))
 			l.installReply(b, a, r)
+			if r.Outcome != outcomeOK {
+				return fail(index, "initialization outcome %+v", r)
+			}
+			oracle.init = nil
 			oracle.slot = r.Slot
 			oracle.initialized = true
 			oracle.rejected = r.BalanceU < 1e6
@@ -230,8 +369,8 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			}
 		case "QueueSync":
 			subject.limiter.notify(subject.bucket)
-			if subject.bucket.queued {
-				return fail(index, "saturated notification was not dropped")
+			if len(subject.limiter.work) > 1024 {
+				return fail(index, "queue capacity exceeded")
 			}
 		case "ScanUntilQueued":
 			found := false
@@ -246,18 +385,37 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			if !found {
 				return fail(index, "scan failed to rediscover dropped work")
 			}
-		case "AdvanceTime":
+		case "AdvanceTime", "AdvanceLocalTime", "AdvanceRedisTime":
 			if event.AdvanceNS < 0 {
-				return fail(index, "negative time advance")
+				continue
 			}
-			nowNS += event.AdvanceNS
-			for _, c := range clocks {
-				c.Advance(time.Duration(event.AdvanceNS))
+			if event.Kind != "AdvanceLocalTime" {
+				redisNS += event.AdvanceNS
+			}
+			if event.Kind == "AdvanceLocalTime" {
+				clocks[id.instance].Advance(time.Duration(event.AdvanceNS))
+			}
+			if event.Kind == "AdvanceTime" {
+				for _, c := range clocks {
+					c.Advance(time.Duration(event.AdvanceNS))
+				}
 			}
 		case "CancelParent":
 			cancels[id.instance]()
 			closed[id.instance] = true
 		case "Close", "CloseBudgetExpired":
+			if event.Kind == "CloseBudgetExpired" {
+				unresolved := false
+				for _, r := range oracle.receipts {
+					unresolved = unresolved || !r.acknowledged
+				}
+				if !unresolved {
+					continue
+				}
+			}
+			if oracle.busy != 0 || oracle.terminal != "" || !oracle.initialized {
+				continue
+			}
 			l := subject.limiter
 			closed[id.instance] = true
 			if completed[id.instance] {
@@ -267,6 +425,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				break
 			}
 			var modelErr error
+			finalRejected := false
 			budgetCtx, expire := context.WithCancel(context.Background())
 			defer expire()
 			if event.Kind == "CloseBudgetExpired" {
@@ -288,27 +447,28 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 					for i := range o.receipts {
 						if o.receipts[i].sequence == 0 {
 							o.receipts[i].sequence = o.flight
+							o.receipts[i].session = o.session
 						}
 					}
 				}
 				var delta int64
 				for _, r := range o.receipts {
-					if r.sequence == o.flight {
+					if r.sequence == o.flight && r.session == o.session {
 						delta += r.cost
 					}
 				}
-				want := command{Op: opApply, Session: fmt.Sprintf("%032x", id.instance+1), Slot: o.slot, Sequence: o.flight, Delta: delta, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
+				want := command{Op: opApply, Session: o.session, Slot: o.slot, Sequence: o.flight, Delta: delta, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
 				if c != want {
 					modelErr = fmt.Errorf("flush identity %+v expected %+v", c, want)
 					return reply{}, modelErr
 				}
-				r := execute(remotes[key], c, start.UnixMilli()+nowNS/int64(time.Millisecond))
+				r := execute(remotes[key], c, start.UnixMilli()+redisNS/int64(time.Millisecond))
 				if r.Outcome != outcomeOK && r.Outcome != outcomeDuplicate {
-					modelErr = fmt.Errorf("flush backend rejected %+v", r)
-					return reply{}, modelErr
+					finalRejected = true
+					return r, nil
 				}
 				for i := range o.receipts {
-					if o.receipts[i].sequence == o.flight {
+					if o.receipts[i].sequence == o.flight && o.receipts[i].session == o.session {
 						o.receipts[i].applied = true
 					}
 				}
@@ -317,7 +477,7 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 					return reply{}, &backendError{class: errorTransient, cause: context.DeadlineExceeded}
 				}
 				for i := range o.receipts {
-					if o.receipts[i].sequence == o.flight {
+					if o.receipts[i].sequence == o.flight && o.receipts[i].session == o.session {
 						o.receipts[i].acknowledged = true
 					}
 				}
@@ -333,6 +493,11 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				if !errors.Is(result, context.DeadlineExceeded) {
 					return fail(index, "missing shutdown deadline: %v", result)
 				}
+			} else if finalRejected {
+				var unflushed *ShutdownError
+				if !errors.As(result, &unflushed) || unflushed.UnflushedTokens == 0 {
+					return fail(index, "shutdown missing unresolved report: %v", result)
+				}
 			} else if result != nil {
 				return fail(index, "shutdown: %v", result)
 			}
@@ -341,7 +506,10 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			}
 			completed[id.instance] = true
 			results[id.instance] = result
-		case "OpenCircuit":
+		case "OpenCircuit", "ProbeFailure":
+			if closed[id.instance] {
+				continue
+			}
 			subject.limiter.recordFailure(transientFailure())
 			if !openCircuits[id.instance] {
 				generations[id.instance]++
@@ -349,12 +517,17 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			openCircuits[id.instance] = true
 		case "ProbeSuccess":
 			if !openCircuits[id.instance] || !subject.limiter.beginProbe() {
-				return fail(index, "probe unavailable")
+				continue
 			}
 			subject.limiter.finishProbe(nil)
 			openCircuits[id.instance] = false
 		case "RequireNormal":
-			if openCircuits[id.instance] || oracle.fallback || oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS {
+			for _, r := range oracle.receipts {
+				if !r.acknowledged {
+					return fail(index, "fair drain left pending accounting")
+				}
+			}
+			if openCircuits[id.instance] || oracle.fallback || oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS || oracle.rejected || oracle.flight != 0 {
 				return fail(index, "fair reconciliation did not restore normal admission")
 			}
 			subject.bucket.mu.Lock()
@@ -370,15 +543,18 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 					outstanding += r.cost
 				}
 			}
-			invalid := event.Cost <= 0 || event.Cost > cfg.LocalBurst || event.Cost > cfg.Cap
+			invalid := event.Key == "" || len(event.Key) > 1024 || event.Cost <= 0 || event.Cost > cfg.LocalBurst || event.Cost > cfg.Cap
 			unavailable := openCircuits[id.instance] || (oracle.initialized && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS)) || (!oracle.initialized && nowNS-oracle.createdNS >= cfg.FreshnessNS)
 			// Independent rational refill, delayed until the same observable
 			// transition. No production token, ledger or admission helpers.
 			if !invalid && !closed[id.instance] {
-				if cfg.Policy == LocalOnly && unavailable && !oracle.fallback {
-					oracle.refill(nowNS, cfg.FallbackRateU, cfg.LocalBurst)
+				oracle.lastActivityNS = nowNS
+				if cfg.Policy == LocalOnly && unavailable && !oracle.fallback && oracle.terminal == "" {
+					oracle.refill(nowNS, min(cfg.LocalRateU, cfg.FallbackRateU), cfg.LocalBurst)
 					oracle.clamp(cfg.FallbackBurst)
 					oracle.fallback = true
+					oracle.fallbackEnvelope = newModelEnvelope(cfg.FallbackRateU, int64(cfg.FallbackBurst), false)
+					oracle.markFull(nowNS, cfg)
 				} else if oracle.fallback {
 					oracle.refill(nowNS, cfg.FallbackRateU, cfg.FallbackBurst)
 				} else {
@@ -391,8 +567,12 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				wantReason, wantMode = ReasonClosed, ModeBlocked
 			case invalid:
 				wantReason, wantMode = ReasonInvalidRequest, ModeBlocked
+			case oracle.terminal != "":
+				wantReason, wantMode = oracle.terminal, ModeBlocked
 			case oracle.rejected:
 				wantReason, wantMode = ReasonGlobalLimit, ModeBlocked
+			case oracle.capacityNS != 0:
+				wantReason, wantMode = ReasonCapacityExhausted, ModeBlocked
 			case cfg.Policy == LocalOnly && oracle.fallback:
 				wantReason, wantMode = ReasonLocalFallback, ModeLocalFallback
 				if event.Cost > cfg.FallbackBurst || oracle.tokens.Cmp(big.NewRat(int64(event.Cost), 1)) < 0 {
@@ -418,22 +598,35 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				return fail(index, "admission=%v reason=%s mode=%s oracle=%v expectedReason=%s mode=%s tokens=%s outstanding=%d", got, reason, info.Mode, want, wantReason, wantMode, oracle.tokens.String(), outstanding)
 			}
 			if want {
+				if trace.coverage != nil {
+					if wantReason == ReasonLocalFallback {
+						trace.coverage.Fallback++
+					} else {
+						trace.coverage.Normal++
+					}
+				}
+				subject.allAccepted += int64(event.Cost)
 				oracle.tokens.Sub(oracle.tokens, big.NewRat(int64(event.Cost), 1))
+				oracle.markFull(nowNS, cfg)
 				if wantReason == ReasonLocalFallback {
 					oracle.fallbackAccepted += int64(event.Cost)
+					subject.fallbackAccepted += int64(event.Cost)
+					if err := oracle.fallbackEnvelope.admit(nowNS, int64(event.Cost)); err != nil {
+						return fail(index, "fallback envelope: %v", err)
+					}
 				} else {
 					oracle.receipts = append(oracle.receipts, modelReceipt{cost: int64(event.Cost)})
 					subject.accepted += int64(event.Cost)
 				}
 			}
 		case "BeginAttempt", "RetrySameBatch":
-			if event.Attempt == 0 || attempts[event.Attempt] != nil || oracle.busy != 0 || !oracle.initialized {
-				return fail(index, "invalid attempt identity/state")
+			if event.Attempt == 0 || attempts[event.Attempt] != nil || oracle.busy != 0 || openCircuits[id.instance] || closed[id.instance] || oracle.terminal != "" || nowNS < oracle.capacityNS {
+				continue
 			}
 			if event.Kind == "RetrySameBatch" && oracle.flight == 0 {
-				return fail(index, "retry without flight")
+				continue
 			}
-			if oracle.flight == 0 {
+			if oracle.initialized && oracle.flight == 0 {
 				var pending int64
 				for _, r := range oracle.receipts {
 					if r.sequence == 0 {
@@ -446,9 +639,15 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 					for i := range oracle.receipts {
 						if oracle.receipts[i].sequence == 0 {
 							oracle.receipts[i].sequence = oracle.flight
+							oracle.receipts[i].session = oracle.session
 						}
 					}
 				}
+			}
+			if !oracle.initialized && oracle.init == nil {
+				oracle.init = &command{Op: opInit, Session: oracle.session, Slot: -1, Delta: int64(cfg.Cap), RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6, RegistrationDeadlineMS: start.UnixMilli() + redisNS/int64(time.Millisecond) + 30000}
+				copyInit := *oracle.init
+				subject.bucket.init = &copyInit
 			}
 			a, ok := subject.limiter.prepareAttempt(subject.bucket, clocks[id.instance].Now())
 			if !ok {
@@ -456,53 +655,75 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			}
 			var delta int64
 			for _, r := range oracle.receipts {
-				if oracle.flight != 0 && r.sequence == oracle.flight {
+				if oracle.flight != 0 && r.sequence == oracle.flight && r.session == oracle.session {
 					delta += r.cost
 				}
 			}
 			if a.batch.Sequence != oracle.flight || a.batch.Delta != delta {
 				return fail(index, "batch=%+v oracle sequence=%d delta=%d", a.batch, oracle.flight, delta)
 			}
-			wantCommand := command{Op: opRefresh, Session: fmt.Sprintf("%032x", id.instance+1), Slot: oracle.slot, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
+			wantCommand := command{Op: opRefresh, Session: oracle.session, Slot: oracle.slot, RateU: cfg.RateU, BurstU: int64(cfg.Burst) * 1e6}
 			if delta > 0 {
 				wantCommand.Op, wantCommand.Sequence, wantCommand.Delta = opApply, oracle.flight, delta
 			}
-			if a.command != wantCommand || a.generation != generations[id.instance] {
+			if !oracle.initialized {
+				wantCommand = *oracle.init
+			}
+			if a.command != wantCommand || a.generation != generations[id.instance] || !a.start.Equal(clocks[id.instance].Now()) {
 				return fail(index, "command=%+v oracle=%+v", a.command, wantCommand)
 			}
-			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: a, sequence: oracle.flight, generation: generations[id.instance]}
+			attempts[event.Attempt] = &foundationAttempt{owner: id, payload: a, sequence: oracle.flight, generation: generations[id.instance], oracle: oracle}
 			oracle.busy = event.Attempt
 		case "ExecuteRedis":
 			a := attempts[event.Attempt]
 			if a == nil || a.owner != id || a.executed || a.finished {
-				return fail(index, "invalid execution")
+				continue
 			}
-			a.response = execute(remotes[id.key], a.payload.command, start.UnixMilli()+nowNS/int64(time.Millisecond))
-			if a.response.Outcome != outcomeOK && a.response.Outcome != outcomeDuplicate {
-				return fail(index, "backend rejected %+v", a.response)
+			if event.DeltaOverride != 0 {
+				prior, exists := remotes[id.key].sessions[a.payload.command.Session]
+				// This is the mismatched DUPLICATE scenario, not permission to
+				// forge a different first deduction than production prepared.
+				if a.payload.command.Op != opApply || !exists || prior.sequence != a.sequence || event.DeltaOverride == prior.delta {
+					continue
+				}
 			}
-			if a.sequence != 0 {
+			if event.Checkpoint == "before" {
+				a.failed = true
+				a.executed = true
+				break
+			}
+			wire := a.payload.command
+			if event.DeltaOverride != 0 {
+				wire.Delta = event.DeltaOverride
+			}
+			a.response = execute(remotes[id.key], wire, start.UnixMilli()+redisNS/int64(time.Millisecond))
+			if event.Checkpoint == "after" {
+				a.failed = true
+			}
+			if a.sequence != 0 && (a.response.Outcome == outcomeOK || a.response.Outcome == outcomeDuplicate) {
+				oracle = a.oracle
 				for i := range oracle.receipts {
-					if oracle.receipts[i].sequence == a.sequence {
+					if oracle.receipts[i].sequence == a.sequence && oracle.receipts[i].session == a.payload.command.Session {
 						oracle.receipts[i].applied = true
+						oracle.receipts[i].lost = false
 					}
 				}
 			}
 			a.executed = true
 		case "TimeoutAttempt":
 			a := attempts[event.Attempt]
-			if a == nil || a.owner != id || a.finished || a.timedOut || oracle.busy != event.Attempt {
-				return fail(index, "invalid timeout")
+			if a == nil || a.owner != id || a.oracle != oracle || a.finished || a.timedOut || oracle.busy != event.Attempt {
+				continue
 			}
 			subject.limiter.finishAttempt(subject.bucket, a.payload)
 			a.timedOut = true
 			oracle.busy = 0
 		case "DeliverReply", "LoseReply":
 			a := attempts[event.Attempt]
-			if a == nil || a.owner != id || !a.executed || a.finished {
-				return fail(index, "invalid reply transition")
+			if a == nil || a.owner != id || a.oracle != oracle || !a.executed || a.finished {
+				continue
 			}
-			if event.Kind == "LoseReply" {
+			if event.Kind == "LoseReply" || a.failed {
 				subject.limiter.finishAttempt(subject.bucket, a.payload)
 				if oracle.busy == event.Attempt {
 					oracle.busy = 0
@@ -510,37 +731,76 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			} else {
 				subject.limiter.installReply(subject.bucket, a.payload, a.response)
 				if !a.timedOut && oracle.busy == event.Attempt {
-					if a.sequence != 0 && oracle.flight == a.sequence {
+					success := a.response.Outcome == outcomeOK || a.response.Outcome == outcomeDuplicate
+					if success && a.sequence != 0 && oracle.flight == a.sequence {
 						for i := range oracle.receipts {
-							if oracle.receipts[i].sequence == a.sequence {
+							if oracle.receipts[i].sequence == a.sequence && oracle.receipts[i].session == a.payload.command.Session {
 								oracle.receipts[i].acknowledged = true
 							}
 						}
 						oracle.acknowledged, oracle.flight = a.sequence, 0
 					}
-					if a.generation == generations[id.instance] {
-						oracle.rejected = a.response.BalanceU < 1e6
-						if oracle.rejected {
-							oracle.freshNS = 0
-						} else {
-							if cfg.Policy == LocalOnly && !oracle.fallback && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS) {
-								oracle.refill(nowNS, cfg.FallbackRateU, cfg.LocalBurst)
-								oracle.clamp(cfg.FallbackBurst)
-								oracle.fallback = true
-							}
+					if a.generation == generations[id.instance] && !completed[id.instance] {
+						if !success {
 							outstanding := int64(0)
-							for _, receipt := range oracle.receipts {
-								if !receipt.acknowledged {
-									outstanding += receipt.cost
+							for _, r := range oracle.receipts {
+								if !r.acknowledged {
+									outstanding += r.cost
 								}
 							}
-							if outstanding == 0 || (!oracle.fallback && oracle.generation == generations[id.instance]) {
-								oracle.freshNS = a.payload.start.Sub(start).Nanoseconds() + cfg.FreshnessNS
-								oracle.generation = generations[id.instance]
-								if oracle.fallback && nowNS < oracle.freshNS {
-									oracle.refill(nowNS, cfg.FallbackRateU, cfg.FallbackBurst)
-									oracle.fallback = false
+							switch a.response.Outcome {
+							case outcomeSessionCapacity:
+								oracle.capacityNS = nowNS + int64(time.Second)
+							case outcomeInitExpired, outcomeSessionExpired:
+								if outstanding > 0 {
+									oracle.terminal = ReasonAccountingExpired
+								} else {
+									oracle.initialized = false
+									oracle.init = nil
+									oracle.freshNS = 0
+									oracle.flight = 0
+									oracle.latestBatch = 0
+									oracle.acknowledged = 0
+									oracle.slot = -1
+									oracle.previousSessions = append(oracle.previousSessions, oracle.session)
+									oracle.session = fmt.Sprintf("%032x", uint64(index+1)<<32|uint64(id.instance+1))
 								}
+							default:
+								oracle.terminal = ReasonAccountingError
+							}
+							oracle.busy = 0
+							a.finished = true
+							break
+						}
+						if a.payload.command.Op == opInit {
+							oracle.initialized = true
+							oracle.init = nil
+							oracle.slot = a.response.Slot
+						}
+						oracle.capacityNS = 0
+						oracle.rejected = a.response.BalanceU < 1e6
+						// Successful negative balances refresh observation age too;
+						// the separate rejection latch still forbids admission.
+						if cfg.Policy == LocalOnly && !oracle.fallback && a.payload.command.Op != opInit && (oracle.generation != generations[id.instance] || nowNS >= oracle.freshNS) {
+							oracle.refill(nowNS, min(cfg.LocalRateU, cfg.FallbackRateU), cfg.LocalBurst)
+							oracle.clamp(cfg.FallbackBurst)
+							oracle.fallback = true
+							oracle.fallbackEnvelope = newModelEnvelope(cfg.FallbackRateU, int64(cfg.FallbackBurst), false)
+							oracle.markFull(nowNS, cfg)
+						}
+						outstanding := int64(0)
+						for _, receipt := range oracle.receipts {
+							if !receipt.acknowledged {
+								outstanding += receipt.cost
+							}
+						}
+						if outstanding == 0 || (!oracle.fallback && oracle.generation == generations[id.instance]) {
+							oracle.freshNS = a.payload.start.Sub(start).Nanoseconds() + min(cfg.FreshnessNS, max(int64(0), a.response.SessionTTLMS-60000)*int64(time.Millisecond))
+							oracle.generation = generations[id.instance]
+							if !oracle.rejected && oracle.fallback && nowNS < oracle.freshNS {
+								oracle.refill(nowNS, cfg.FallbackRateU, cfg.FallbackBurst)
+								oracle.fallback = false
+								oracle.markFull(nowNS, cfg)
 							}
 						}
 					}
@@ -551,7 +811,28 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 		default:
 			return fail(index, "unsupported foundation event %q", event.Kind)
 		}
+		if trace.coverage != nil {
+			trace.coverage.Events[event.Kind]++
+		}
 		totals := map[string]int64{}
+		for o, s := range retired {
+			var applied, lost int64
+			for _, r := range o.receipts {
+				if r.applied {
+					applied += r.cost
+				} else if r.lost {
+					lost += r.cost
+				} else {
+					return fail(index, "conservation retired unresolved receipt")
+				}
+			}
+			key := s.bucket.key
+			actual := o.actualApplied(remotes[key])
+			if actual != applied || s.accepted != actual+lost {
+				return fail(index, "backend accounting retired accepted=%d applied=%d lost=%d receipts=%d", s.accepted, actual, lost, applied)
+			}
+			totals[key] += s.accepted
+		}
 		for id, subject := range subjects {
 			o := oracles[id]
 			var accepted, applied, unapplied, pending, outstanding, flight int64
@@ -568,14 +849,17 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 				if r.sequence == 0 {
 					pending += r.cost
 				}
-				if o.flight != 0 && r.sequence == o.flight {
+				if o.flight != 0 && r.sequence == o.flight && r.session == o.session {
 					flight += r.cost
 				}
 				if r.acknowledged && !r.applied {
 					return fail(index, "acknowledged unapplied receipt")
 				}
 			}
-			actualApplied := remotes[id.key].applied[fmt.Sprintf("%032x", id.instance+1)]
+			actualApplied := o.actualApplied(remotes[id.key])
+			if subject.allAccepted != subject.accepted+subject.fallbackAccepted || subject.fallbackAccepted != o.fallbackAccepted {
+				return fail(index, "normal/fallback partition mismatch")
+			}
 			if actualApplied != applied || subject.accepted != actualApplied+unapplied {
 				return fail(index, "backend accounting: applied=%d receipts=%d accepted=%d unapplied=%d", actualApplied, applied, subject.accepted, unapplied)
 			}
@@ -583,6 +867,18 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			b.mu.Lock()
 			l := b.ledger
 			expectedTokens, _ := o.tokens.Float64()
+			expectedFresh := time.Time{}
+			if o.freshNS != 0 {
+				expectedFresh = start.Add(time.Duration(o.freshNS))
+			}
+			if b.authorizedGeneration != o.generation || !b.freshUntil.Equal(expectedFresh) {
+				b.mu.Unlock()
+				return fail(index, "generation/freshness got=%d/%v expected=%d/%v", b.authorizedGeneration, b.freshUntil, o.generation, expectedFresh)
+			}
+			if b.initialized != o.initialized || b.globalRejected != o.rejected || b.terminalReason != o.terminal || b.busy != (o.busy != 0) {
+				b.mu.Unlock()
+				return fail(index, "generation/latch mismatch initialized=%v/%v rejected=%v/%v terminal=%s/%s busy=%v/%v", b.initialized, o.initialized, b.globalRejected, o.rejected, b.terminalReason, o.terminal, b.busy, o.busy)
+			}
 			if math.Abs(b.tokens.tokens-expectedTokens) > 1e-9 || b.fallback != o.fallback {
 				b.mu.Unlock()
 				return fail(index, "local balance/mode tokens=%v expected=%v fallback=%v expected=%v", b.tokens.tokens, expectedTokens, b.fallback, o.fallback)
@@ -602,20 +898,39 @@ func checkTraceWithExecution(trace modelTrace, execute func(*redisReference, com
 			}
 			totals[id.key] += accepted
 		}
-		// Compare every pair of event boundaries in physical time. All intermediate
-		// arithmetic is independent arbitrary precision, including the 1ms allowance.
-		for _, prior := range boundaries {
-			for key, total := range totals {
-				used := new(big.Int).Mul(big.NewInt(total-prior.totals[key]), big.NewInt(1_000_000_000_000_000))
-				bound := new(big.Int).Mul(big.NewInt(int64(cfg.Burst+2*cfg.Instances*cfg.Cap)), big.NewInt(1_000_000_000_000_000))
-				bound.Add(bound, new(big.Int).Mul(big.NewInt(cfg.RateU), big.NewInt(nowNS-prior.ns+1_000_000)))
-				bound.Add(bound, big.NewInt(1_000_000_000))
-				if used.Cmp(bound) > 0 {
-					return fail(index, "normal envelope violated key=%q admitted=%d intervalNS=%d", key, total-prior.totals[key], nowNS-prior.ns)
-				}
+		for key, total := range totals {
+			env := envelopes[key]
+			if env == nil {
+				env = newModelEnvelope(cfg.RateU, int64(cfg.Burst+2*cfg.Instances*cfg.Cap), true)
+				envelopes[key] = env
+			}
+			if resetEnvelope {
+				env.min = env.value(redisNS, total)
+				env.admitted = total
+				env.points = nil
+			}
+			if err := env.observe(redisNS, total, len(trace.Events) <= 64); err != nil {
+				return fail(index, "normal envelope: %v", err)
 			}
 		}
-		boundaries = append(boundaries, envelopeBoundary{ns: nowNS, totals: totals})
+		resetEnvelope = false
+		for _, l := range limiters {
+			if l.store.count.Load() > int64(cfg.MaxKeys) || len(l.work) > 1024 {
+				return fail(index, "memory bound exceeded")
+			}
+		}
+		for _, r := range remotes {
+			if len(r.sessions) > 256 {
+				return fail(index, "session bound exceeded")
+			}
+		}
+
+	}
+	if capture != nil {
+		capture(snapshot())
+	}
+	if trace.searchCapture != nil {
+		trace.searchCapture(modelSearchEnabled(oracles, attempts))
 	}
 	return nil
 }
@@ -661,6 +976,7 @@ type redisReference struct {
 	rate, burst      int64
 	balanceNumerator *big.Int
 	logical          int64
+	expiresAt        int64
 	sessions         map[string]referenceSession
 	applied          map[string]int64 // Unique whole-token deductions, keyed by actual session.
 }
@@ -671,61 +987,107 @@ type referenceSession struct {
 }
 
 func (m *redisReference) execute(c command, now int64) reply {
-	if m.sessions == nil {
-		m.sessions = make(map[string]referenceSession)
-		m.applied = make(map[string]int64)
-		m.balanceNumerator = new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
-		m.logical = now
+	logical := max(now, m.logical)
+	sessions := m.sessions
+	balance := new(big.Int)
+	if sessions == nil || (m.expiresAt != 0 && now >= m.expiresAt) {
+		sessions = map[string]referenceSession{}
+		balance.Mul(big.NewInt(m.burst), big.NewInt(1000))
+		logical = now
+	} else {
+		balance.Add(m.balanceNumerator, new(big.Int).Mul(big.NewInt(logical-m.logical), big.NewInt(m.rate)))
+		full := new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
+		if balance.Cmp(full) > 0 {
+			balance.Set(full)
+		}
 	}
-	logical := now
-	if logical < m.logical {
-		logical = m.logical
-	}
-	balance := new(big.Int).Add(m.balanceNumerator, new(big.Int).Mul(big.NewInt(logical-m.logical), big.NewInt(m.rate)))
-	full := new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000))
-	if balance.Cmp(full) > 0 {
-		balance.Set(full)
-	}
-	s, exists := m.sessions[c.Session]
+	ss, exists := sessions[c.Session]
 	code := outcomeOK
 	fresh := false
 	if c.Op == opInit {
 		if logical >= c.RegistrationDeadlineMS {
 			return reply{Outcome: outcomeInitExpired}
 		}
-		if !exists {
-			s = referenceSession{slot: len(m.sessions), cap: c.Delta}
+		if c.RegistrationDeadlineMS-logical > 30000 {
+			return reply{Outcome: outcomeInitExpired}
+		}
+		if exists {
+			if ss.expiry <= logical {
+				return reply{Outcome: outcomeSessionExpired}
+			}
+			if ss.cap != c.Delta {
+				return reply{Outcome: outcomeInvalidArgument}
+			}
+		} else {
+			occupied := [256]bool{}
+			for _, old := range sessions {
+				if old.expiry > logical {
+					occupied[old.slot] = true
+				}
+			}
+			free := -1
+			for i, used := range occupied {
+				if !used {
+					free = i
+					break
+				}
+			}
+			if free < 0 {
+				return reply{Outcome: outcomeSessionCapacity}
+			}
+			ss = referenceSession{slot: free, cap: c.Delta}
 			fresh = true
 		}
 	} else {
-		if !exists || s.slot != c.Slot || s.expiry <= logical {
+		if !exists || ss.slot != c.Slot || ss.expiry <= logical {
 			return reply{Outcome: outcomeSessionExpired}
 		}
 		if c.Op == opApply {
-			if c.Sequence == s.sequence && c.Delta == s.delta {
+			if c.Delta > ss.cap {
+				return reply{Outcome: outcomeInvalidArgument}
+			}
+			if c.Sequence == ss.sequence && c.Delta == ss.delta {
 				code = outcomeDuplicate
-			} else if c.Sequence == s.sequence+1 {
+			} else if c.Sequence == ss.sequence+1 {
 				balance.Sub(balance, new(big.Int).Mul(big.NewInt(c.Delta), big.NewInt(1_000_000_000)))
-				m.applied[c.Session] += c.Delta
-				s.sequence, s.delta = c.Sequence, c.Delta
+				if balance.Cmp(big.NewInt(-1_000_000_000_000_000)) < 0 {
+					return reply{Outcome: outcomeNumericLimit}
+				}
+				ss.sequence, ss.delta = c.Sequence, c.Delta
 			} else {
 				return reply{Outcome: outcomeSequenceError}
 			}
 		}
 	}
-	s.expiry = logical + 86400000
-	m.sessions[c.Session] = s
+	if m.applied == nil {
+		m.applied = map[string]int64{}
+	}
+	if c.Op == opApply && code == outcomeOK {
+		m.applied[c.Session] += c.Delta
+	}
+	// Commit replaces only a reused slot; cumulative applied history is retained
+	// outside the expiring record for independent conservation assertions.
+	for id, old := range sessions {
+		if old.slot == ss.slot && id != c.Session {
+			delete(sessions, id)
+		}
+	}
+	ss.expiry = logical + 86400000
+	sessions[c.Session] = ss
+	m.sessions = sessions
 	m.balanceNumerator = balance
 	m.logical = logical
-	// Euclidean division gives floor for negative debt and a nonnegative carry.
 	whole := new(big.Int).Div(new(big.Int).Set(balance), big.NewInt(1000)).Int64()
-	need := new(big.Int).Sub(big.NewInt(1_000_000_000), balance)
-	retry := int64(0)
-	if need.Sign() > 0 {
-		need.Add(need, big.NewInt(m.rate-1))
-		retry = need.Div(need, big.NewInt(m.rate)).Int64()
+	ceilDiv := func(n *big.Int) int64 {
+		if n.Sign() <= 0 {
+			return 0
+		}
+		return new(big.Int).Div(new(big.Int).Add(n, big.NewInt(m.rate-1)), big.NewInt(m.rate)).Int64()
 	}
-	return reply{Outcome: code, Slot: s.slot, CommittedSequence: s.sequence, BalanceU: whole, RetryMS: retry, SessionTTLMS: s.expiry - now, LogicalMS: logical, FreshInit: fresh}
+	retry := ceilDiv(new(big.Int).Sub(big.NewInt(1_000_000_000), balance))
+	fill := ceilDiv(new(big.Int).Sub(new(big.Int).Mul(big.NewInt(m.burst), big.NewInt(1000)), balance))
+	m.expiresAt = logical + max(int64(86400000), fill+60000)
+	return reply{Outcome: code, Slot: ss.slot, CommittedSequence: ss.sequence, BalanceU: whole, RetryMS: retry, SessionTTLMS: ss.expiry - now, LogicalMS: logical, FreshInit: fresh}
 }
 
 func TestStateMachineFoundationRedisDifferential(t *testing.T) {

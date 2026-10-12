@@ -1,0 +1,125 @@
+{
+  "Seed": 20261021,
+  "Config": {
+    "Instances": 2,
+    "RateU": 1000000,
+    "Burst": 5,
+    "Cap": 5,
+    "LocalBurst": 5,
+    "LocalRateU": 10000000,
+    "Policy": 1,
+    "FallbackBurst": 3,
+    "FallbackRateU": 2000000
+  },
+  "Events": [
+    {
+      "Kind": "CreateKey",
+      "Key": "k",
+      "Instance": 0
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "k",
+      "Instance": 0
+    },
+    {
+      "Kind": "CreateKey",
+      "Key": "k",
+      "Instance": 1
+    },
+    {
+      "Kind": "Initialize",
+      "Key": "k",
+      "Instance": 1
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Instance": 0,
+      "Cost": 5
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Instance": 0,
+      "Attempt": 1
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Instance": 0,
+      "Attempt": 1
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Instance": 0,
+      "Attempt": 1
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 2
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Instance": 1,
+      "Cost": 1
+    },
+    {
+      "Kind": "AdvanceRedisTime",
+      "Key": "k",
+      "Instance": 0,
+      "AdvanceNS": 1000000000
+    },
+    {
+      "Kind": "AdvanceLocalTime",
+      "Key": "k",
+      "Instance": 1,
+      "AdvanceNS": 10000000
+    },
+    {
+      "Kind": "BeginAttempt",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 3
+    },
+    {
+      "Kind": "ExecuteRedis",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 3
+    },
+    {
+      "Kind": "DeliverReply",
+      "Key": "k",
+      "Instance": 1,
+      "Attempt": 3
+    },
+    {
+      "Kind": "RequireNormal",
+      "Key": "k",
+      "Instance": 1
+    },
+    {
+      "Kind": "AllowN",
+      "Key": "k",
+      "Instance": 1,
+      "Cost": 5
+    }
+  ]
+}
