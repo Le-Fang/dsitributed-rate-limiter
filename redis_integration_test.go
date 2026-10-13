@@ -347,6 +347,9 @@ func TestRedisIntegrationBackendNOSCRIPT(t *testing.T) {
 	client, _ := redisFixture(t)
 	// SCRIPT FLUSH is server-wide. It is allowed only on the dedicated fixture.
 	if os.Getenv("REDIS_ISOLATED") != "1" {
+		if os.Getenv("REQUIRE_REDIS") == "1" {
+			t.Fatal("required NOSCRIPT coverage needs REDIS_ISOLATED=1")
+		}
 		t.Skip("NOSCRIPT flush requires dedicated fixture REDIS_ISOLATED=1")
 	}
 	c, err := normalizeConfig(Config{GlobalRate: 1, GlobalBurst: 1, Redis: RedisConfig{Client: client, Prefix: fmt.Sprintf("rl-noscript-%d", time.Now().UnixNano()), Timeout: time.Second}, MaxSyncAge: 2 * time.Second})

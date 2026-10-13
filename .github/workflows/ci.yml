@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.21.x', '1.27.x']
+        go: ['1.21.x', '1.27.3']
     env:
       GOTOOLCHAIN: local
     steps:
@@ -30,11 +30,11 @@ jobs:
       - run: go test -timeout 3m ./...
         timeout-minutes: 5
       - run: go test -race -timeout 3m ./...
-        if: matrix.go == '1.27.x'
+        if: matrix.go == '1.27.3'
         timeout-minutes: 5
       - name: Bounded scheduler capacity smoke
-        run: go test -race -run '^TestLoadCapacitySmoke$' -count=1 .
-        if: matrix.go == '1.27.x'
+        run: go test -race -timeout 90s -run '^TestLoadCapacitySmoke$' -count=1 .
+        if: matrix.go == '1.27.3'
         timeout-minutes: 2
       - run: go vet ./...
         timeout-minutes: 3
@@ -50,21 +50,26 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.3'
           cache-dependency-path: go.sum
       - name: Install pinned scanner outside library module
         run: GOBIN="$RUNNER_TEMP/bin" go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
         timeout-minutes: 5
       - name: Scan reachable vulnerabilities
-        run: "$RUNNER_TEMP/bin/govulncheck" ./...
+        run: |
+          "$RUNNER_TEMP/bin/govulncheck" ./...
         timeout-minutes: 5
 
   redis:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: ['7.4.11-alpine', '8.10.2-alpine']
     services:
       redis:
-        image: redis:7.4.11-alpine
+        image: redis:${{ matrix.redis }}
         ports:
           - 6379:6379
         options: >-
@@ -83,7 +88,47 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.3'
           cache-dependency-path: go.sum
-      - run: go test -timeout 3m -run 'Test(Redis|Protocol|StateMachineFoundation|SchedulerConstructorRedis)' -count=1 .
+      - name: Required real Redis conformance (including race detection)
+        run: go test -race -timeout 3m -run '^TestRedisIntegration' -count=1 .
         timeout-minutes: 5
+      - name: Independent foundation differential and constructor
+        run: go test -race -timeout 3m -run '^Test(StateMachineFoundationRedis|SchedulerConstructorRedis)' -count=1 .
+        timeout-minutes: 5
+
+  redis-topology:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+      REQUIRE_REDIS_CLUSTER: '1'
+      REDIS_CLUSTER_ADDRS: 127.0.0.1:17000,127.0.0.1:17001,127.0.0.1:17002
+      REQUIRE_REDIS_SENTINEL: '1'
+      REDIS_SENTINEL_ADDRS: 127.0.0.1:27379
+      REDIS_SENTINEL_MASTER: limiter-test
+      REDIS_SENTINEL_ISOLATED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: go.sum
+      - name: Start isolated three-master Cluster and Sentinel fixtures
+        run: docker compose -p rate-limiter-ci -f compose.test.yaml --profile topology up -d --wait --wait-timeout 90 cluster sentinel
+        timeout-minutes: 3
+      - name: Required routing and actual failover with unchanged retry identity
+        run: go test -race -timeout 2m -run '^TestRedis(Cluster|Sentinel)Integration$' -count=1 .
+        timeout-minutes: 3
+      - name: Fixture diagnostics
+        if: failure()
+        run: |
+          docker compose -p rate-limiter-ci -f compose.test.yaml --profile topology logs
+          docker compose -p rate-limiter-ci -f compose.test.yaml exec -T sentinel sh -c 'cat /tmp/rate-limiter-topology/sentinel.log /tmp/rate-limiter-topology/*/server.log'
+        timeout-minutes: 1
+      - name: Remove isolated fixtures and volumes
+        if: always()
+        run: docker compose -p rate-limiter-ci -f compose.test.yaml --profile topology down --volumes --remove-orphans
+        timeout-minutes: 1

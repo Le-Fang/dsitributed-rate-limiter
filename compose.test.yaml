@@ -8,3 +8,35 @@ services:
       interval: 1s
       timeout: 1s
       retries: 20
+  redis-current:
+    profiles: [current]
+    image: redis:8.10.2-alpine
+    command: [redis-server, --save, '', --appendonly, 'no', --maxmemory-policy, noeviction]
+    ports: ['127.0.0.1:16381:6379']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+  cluster:
+    profiles: [topology]
+    image: redis:8.10.2-alpine
+    command: [sh, /fixtures/topology.sh, cluster]
+    volumes: ['./testdata/redis:/fixtures:ro']
+    ports: ['127.0.0.1:17000:17000', '127.0.0.1:17001:17001', '127.0.0.1:17002:17002']
+    healthcheck:
+      test: [CMD-SHELL, 'test -f /tmp/rate-limiter-topology/ready && redis-cli -p 17000 cluster info | grep -q cluster_state:ok']
+      interval: 1s
+      timeout: 1s
+      retries: 30
+  sentinel:
+    profiles: [topology]
+    image: redis:8.10.2-alpine
+    command: [sh, /fixtures/topology.sh, sentinel]
+    volumes: ['./testdata/redis:/fixtures:ro']
+    ports: ['127.0.0.1:17379:17379', '127.0.0.1:17380:17380', '127.0.0.1:27379:27379']
+    healthcheck:
+      test: [CMD-SHELL, 'test -f /tmp/rate-limiter-topology/ready && redis-cli -p 27379 sentinel ckquorum limiter-test | grep -q OK && redis-cli -p 17380 info replication | grep -q master_link_status:up']
+      interval: 1s
+      timeout: 1s
+      retries: 30
