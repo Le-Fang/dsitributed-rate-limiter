@@ -1,3 +1,23 @@
+// Package ratelimiter provides an embedded two-tier token bucket with local
+// admission and asynchronous Redis accounting. Allow and AllowN perform no
+// network I/O and never wait for synchronization. A cold key returns sync_pending
+// until background initialization completes. Redis balances are observations,
+// not reservations; MaxOutstanding bounds pending plus in-flight normal tokens.
+//
+// FailClosed is the default. Explicit LocalOnly uses FallbackRate/FallbackBurst
+// during transient unavailability; fallback traffic is measured separately and
+// never replayed into Redis. Global rejection and terminal errors override it.
+// For fixed N instances, intact state and non-jumping clocks, normal admission
+// over physical duration T is bounded by B+R*(T+1ms)+2*N*C+0.000001 tokens, where
+// R/B are the effective global rate/burst and C is MaxOutstanding. One fallback
+// episode of F seconds adds at most N*(FallbackBurst+FallbackRate*F) per key.
+// Crashes, restarts and lost Redis writes require additional exposure accounting.
+//
+// NewLimiter is the composition root. Close stops admission and shares a bounded
+// final flush; injected clients remain caller-owned. See README.md for policy,
+// session lifetime, key framing and operational assumptions, and BENCHMARKS.md
+// for measured capacity limits. Source compatibility starts at Go 1.21; use a
+// currently supported Go toolchain in production.
 package ratelimiter
 
 import (
